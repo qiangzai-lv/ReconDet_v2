@@ -69,7 +69,7 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
     def simple_process(self, data: dict, training: bool = False) -> dict:
 
         if 'img' in data['inputs']:
-            batch_pad_shape = self._get_pad_shape(data)  # [(240, 320)]
+            batch_pad_shape = self._get_pad_shape(data)
 
         data = self.collate_data(data)  # after collate. inputs['imgs]=(bs, 40, 3, h, w). bgr2rgb, normalized
         inputs, data_samples = data['inputs'], data['data_samples']
@@ -185,10 +185,6 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
                     f'{type(data)}: {data}')
 
             data['inputs']['imgs'] = batch_imgs  # (bs, 40, 3, 240, 320). bgr2rgb, normalized
-        if 'raydirs' in data['inputs']:
-            _batch_dirs = data['inputs']['raydirs']
-            batch_dirs = stack_batch(_batch_dirs)
-            data['inputs']['raydirs'] = batch_dirs
 
         data.setdefault('data_samples', None)
 

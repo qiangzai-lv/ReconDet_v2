@@ -56,12 +56,34 @@ class GroundingDINO(DINO):
                  language_model,
                  *args,
                  use_autocast=False,
+                 freeze_modules=None,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
+        self.freeze_modules = tuple(freeze_modules or ())
         super().__init__(*args, **kwargs)
+        self._freeze_configured_modules()
+
+    def _freeze_configured_modules(self):
+        """Disable gradients and training-mode updates for selected modules."""
+        for module_name in self.freeze_modules:
+            if not hasattr(self, module_name):
+                raise ValueError(
+                    f'Cannot freeze unknown GroundingDINO module: {module_name}')
+            module = getattr(self, module_name)
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
+            module.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        # Parent train() recursively switches every child back to train mode.
+        # Re-apply eval mode to frozen modules after that recursion.
+        for module_name in self.freeze_modules:
+            getattr(self, module_name).eval()
+        return self
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""

@@ -1,34 +1,65 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-import numpy as np
 import torch
 
 
-def closed_form_inverse_se3(se3, R=None, T=None):
-    """Invert a batch of 3x4 or 4x4 SE(3) matrices."""
-    is_numpy = isinstance(se3, np.ndarray)
+def depth_to_cam_coords_points_torch(
+    depth_map: torch.Tensor,
+    intrinsic: torch.Tensor,
+) -> torch.Tensor:
+    batch_size, num_frames, height, width = depth_map.shape
+    u, v = torch.meshgrid(
+        torch.arange(width, device=depth_map.device),
+        torch.arange(height, device=depth_map.device),
+        indexing="xy",
+    )
+    u = u.reshape(1, 1, height, width).expand(batch_size, num_frames, -1, -1)
+    v = v.reshape(1, 1, height, width).expand(batch_size, num_frames, -1, -1)
 
-    if se3.shape[-2:] != (4, 4) and se3.shape[-2:] != (3, 4):
-        raise ValueError(f"se3 must have shape (N, 4, 4) or (N, 3, 4), got {se3.shape}")
+    focal_x = intrinsic[..., 0, 0].view(batch_size, num_frames, 1, 1)
+    focal_y = intrinsic[..., 1, 1].view(batch_size, num_frames, 1, 1)
+    center_x = intrinsic[..., 0, 2].view(batch_size, num_frames, 1, 1)
+    center_y = intrinsic[..., 1, 2].view(batch_size, num_frames, 1, 1)
 
-    if R is None:
-        R = se3[:, :3, :3]
-    if T is None:
-        T = se3[:, :3, 3:]
+    x_cam = (u - center_x) * depth_map / focal_x
+    y_cam = (v - center_y) * depth_map / focal_y
+    return torch.stack([x_cam, y_cam, depth_map], dim=-1)
 
-    if is_numpy:
-        R_t = np.transpose(R, (0, 2, 1))
-        top_right = -np.matmul(R_t, T)
-        inverted = np.tile(np.eye(4), (len(R), 1, 1))
-    else:
-        R_t = R.transpose(1, 2)
-        top_right = -torch.bmm(R_t, T)
-        inverted = torch.eye(4, device=R.device, dtype=R.dtype)[None].repeat(len(R), 1, 1)
 
-    inverted[:, :3, :3] = R_t
-    inverted[:, :3, 3:] = top_right
-    return inverted
+@torch.no_grad()
+def closed_form_inverse_se3_torch(se3: torch.Tensor) -> torch.Tensor:
+    if se3.shape[-2:] == (3, 4):
+        batch_size, num_frames = se3.shape[:2]
+        extended_se3 = torch.zeros(
+            batch_size,
+            num_frames,
+            4,
+            4,
+            device=se3.device,
+            dtype=se3.dtype,
+        )
+        extended_se3[..., :3, :] = se3
+        extended_se3[..., 3, 3] = 1.0
+        se3 = extended_se3
+
+    rotation = se3[..., :3, :3]
+    translation = se3[..., :3, 3:]
+    inverse_rotation = rotation.transpose(-1, -2)
+    inverse_translation = -torch.matmul(inverse_rotation, translation)
+
+    inverse_se3 = torch.zeros_like(se3)
+    inverse_se3[..., :3, :3] = inverse_rotation
+    inverse_se3[..., :3, 3:4] = inverse_translation
+    inverse_se3[..., 3, 3] = 1.0
+    return inverse_se3
+
+
+@torch.no_grad()
+def unproject_depth_map_to_point_map_torch(
+    depth_map: torch.Tensor,
+    extrinsics: torch.Tensor,
+    intrinsics: torch.Tensor,
+) -> torch.Tensor:
+    cam_coords = depth_to_cam_coords_points_torch(depth_map, intrinsics)
+    inverse_extrinsics = closed_form_inverse_se3_torch(extrinsics)
+    cam_coords_h = torch.cat([cam_coords, torch.ones_like(cam_coords[..., :1])], dim=-1)
+    world_coords_h = torch.einsum("bsij,bshwj->bshwi", inverse_extrinsics, cam_coords_h)
+    return world_coords_h[..., :3]

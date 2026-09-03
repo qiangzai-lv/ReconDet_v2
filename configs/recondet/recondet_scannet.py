@@ -12,7 +12,6 @@ resume = False
 
 data_root = '/root/shared-nvme/data/ScanNet_processed'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
-vggt_scene_scale_file = f'{data_root}/vggt_scene_scales.pkl'
 
 custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
 
@@ -36,6 +35,10 @@ model = dict(
         dec_nlayers=_decoder_layer_num
     ),
     deformable_num_points=4,
+    geometry_source='gt',
+    gt_points_dir=f'{data_root}/points',
+    online_scale_point_stride=4,
+    online_scale_max_depth=30.0,
     bbox_head=dict(
         type='ReconDetHead',
         n_classes=18,
@@ -64,20 +67,16 @@ model = dict(
         matcher='one2more',
         matcher_iou_thres=0.1,
         matcher_max_dynamic_samples=5,
-        loss_layer_ids=list(range(_decoder_layer_num))
+        loss_layer_ids=list(range(_decoder_layer_num)),
+        size_logit_range=(-10.0, 10.0)
     ),
-    num_queries=900,
+    num_queries=256,
     token_dim=_token_dim_,
     test_only_last_layer=True,
     if_mix_precision=True,
     use_multi_layers=True,
     if_simpler_project=True,
     if_use_pred_pc_query=True,
-    if_use_atten_sample=False,
-    atten_sample_ratio=10,
-    if_use_atten_fps=True,
-    lambda_dist=0.8,
-    if_task_query=False,
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)
 )
@@ -92,11 +91,13 @@ class_names = [
 ]
 
 train_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'scene_scale'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix',
+    'gt_camera_extrinsics', 'gt_camera_intrinsics'
 ]
 
 test_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'scene_scale'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix',
+    'gt_camera_extrinsics', 'gt_camera_intrinsics'
 ]
 
 input_modality = dict(
@@ -126,7 +127,7 @@ train_pipeline = [
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ]
     ),
-    dict(type='LoadVGGTSceneScaleAndPose', scale_file=vggt_scene_scale_file),
+    dict(type='LoadFirstFramePose'),
     dict(type='PackNeRFDetInputs', keys=train_collect_keys)
 ]
 
@@ -150,7 +151,7 @@ test_pipeline = [
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ]
     ),
-    dict(type='LoadVGGTSceneScaleAndPose', scale_file=vggt_scene_scale_file),
+    dict(type='LoadFirstFramePose'),
     dict(type='PackNeRFDetInputs', keys=test_collect_keys)
 ]
 

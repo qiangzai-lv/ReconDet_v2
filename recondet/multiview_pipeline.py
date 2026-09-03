@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import mmcv
-import mmengine
 import numpy as np
 from mmcv.transforms import BaseTransform, Compose
 from PIL import Image
@@ -53,28 +52,14 @@ def read_pose_matrix(file_path):
 
 
 @TRANSFORMS.register_module()
-class LoadVGGTSceneScaleAndPose(BaseTransform):
-    def __init__(self, scale_file):
-        cache = mmengine.load(scale_file)
-        self.scene_scales = cache.get('scenes', cache)
-        if not isinstance(self.scene_scales, dict):
-            raise TypeError(f'Invalid VGGT scene scale cache: {scale_file}')
-
+class LoadFirstFramePose(BaseTransform):
     def transform(self, results: dict) -> dict:
         first_img_path = results['img_path'][0]
         pose_matrix = read_pose_matrix(str(Path(first_img_path).with_suffix('.txt')))
         if pose_matrix is None:
             raise ValueError(f'Could not load first-frame pose for {first_img_path}')
 
-        scene_id = Path(results['lidar_points']['lidar_path']).stem
-        if scene_id not in self.scene_scales:
-            raise KeyError(f'VGGT scene scale is missing for {scene_id}')
-        scene_scale = float(self.scene_scales[scene_id]['scale'])
-        if not np.isfinite(scene_scale) or scene_scale <= 0:
-            raise ValueError(f'Invalid VGGT scene scale for {scene_id}: {scene_scale}')
-
         results['pose_matrix'] = pose_matrix.astype(np.float32)
-        results['scene_scale'] = scene_scale
         return results
 
 @TRANSFORMS.register_module()
@@ -675,6 +660,7 @@ class MultiViewPipeline_Tgt(BaseTransform):
         imgs = []
         depths = []
         extrinsics = []
+        intrinsics = []
         c2ws = []
         camrotc2ws = []
         lightposes = []
@@ -752,6 +738,10 @@ class MultiViewPipeline_Tgt(BaseTransform):
             ori_shape = _results['ori_shape'] # (968, 1296)
             aft_shape = _results['img_shape'] # (239, 320)
             ratio = ori_shape[0] / aft_shape[0]
+            intrinsic = results['lidar2img']['intrinsic'][:3, :3].copy()
+            intrinsic[0] *= aft_shape[1] / ori_shape[1]
+            intrinsic[1] *= aft_shape[0] / ori_shape[0]
+            intrinsics.append(intrinsic.astype(np.float32))
             # prepare the depth information
             if 'depth_info' in results.keys():
                 if '.npy' in results['depth_info'][i]['filename']:
@@ -864,6 +854,10 @@ class MultiViewPipeline_Tgt(BaseTransform):
         if len(depths) != 0:
             results['depth'] = depths
         results['lidar2img']['extrinsic'] = extrinsics # w2c src view.
+        results['gt_camera_extrinsics'] = np.asarray(
+            extrinsics, dtype=np.float32)[:, :3, :]
+        results['gt_camera_intrinsics'] = np.asarray(
+            intrinsics, dtype=np.float32)
         return results
 
 

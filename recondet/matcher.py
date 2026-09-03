@@ -5,6 +5,53 @@ from torch import nn
 from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
 
 
+def _ensure_finite(name, value):
+    finite = torch.isfinite(value)
+    if finite.all():
+        return
+    invalid_count = int((~finite).sum().item())
+    finite_values = value[finite]
+    finite_range = 'no finite values'
+    if finite_values.numel() > 0:
+        finite_range = (
+            f'finite_min={finite_values.min().item():.6g}, '
+            f'finite_max={finite_values.max().item():.6g}')
+    raise FloatingPointError(
+        f'{name} contains {invalid_count}/{value.numel()} non-finite values; '
+        f'{finite_range}')
+
+
+def _build_cost_matrix(all_centers, all_sizes, all_cls, all_objness,
+                       gt_centers, gt_sizes, gt_labels, cost_weights):
+    for name, value in (
+            ('predicted centers', all_centers),
+            ('predicted sizes', all_sizes),
+            ('classification logits', all_cls),
+            ('objectness scores', all_objness),
+            ('ground-truth centers', gt_centers),
+            ('ground-truth sizes', gt_sizes)):
+        _ensure_finite(name, value)
+
+    pred_boxes = UnifiedMatcher._center_size_pred_to_bbox(
+        None, all_centers, all_sizes)
+    gt_boxes = UnifiedMatcher._center_size_pred_to_bbox(
+        None, gt_centers, gt_sizes)
+    giou = axis_aligned_bbox_overlaps_3d(
+        pred_boxes.unsqueeze(0), gt_boxes.unsqueeze(0), mode='giou').squeeze(0)
+    _ensure_finite('GIoU matching cost', giou)
+
+    cost_class = -all_cls.sigmoid()[:, gt_labels]
+    cost_center = torch.cdist(all_centers, gt_centers, p=1)
+    cost_objness = -all_objness.sigmoid()
+    total_cost = (
+        cost_weights['cls'] * cost_class +
+        cost_weights['center'] * cost_center +
+        cost_weights['obj_ness'] * cost_objness -
+        cost_weights['giou'] * giou)
+    _ensure_finite('Hungarian cost matrix', total_cost)
+    return total_cost, giou
+
+
 class UnifiedMatcher(nn.Module):
     def __init__(self, cost_weights={'cls': 1.0, 'center': 0.0, 'obj_ness': 0.0, 'giou': 2.0}):
         super().__init__()
@@ -15,26 +62,9 @@ class UnifiedMatcher(nn.Module):
         if all_objness.dim() == 1:
             all_objness = all_objness.unsqueeze(-1)
 
-        pred_tp_bbox = self._center_size_pred_to_bbox(all_centers, all_sizes)
-        gt_tp_bbox = self._center_size_pred_to_bbox(gt_centers, gt_sizes)
-
-        with torch.no_grad():
-            giou = axis_aligned_bbox_overlaps_3d(pred_tp_bbox.unsqueeze(0), gt_tp_bbox.unsqueeze(0), mode='giou')
-            assert giou.shape[0] == 1
-            giou = giou.squeeze(0)
-
-        cost_class = -all_cls.sigmoid()[:, gt_labels]  # (Total_Pred, M)
-        cost_center = torch.cdist(all_centers, gt_centers, p=1)  # (Total_Pred, M)
-        cost_objness = -all_objness.sigmoid()  # (Total_Pred, M)
-        # giou = generalized_box3d_iou(pred_corners, gt_corners, torch.tensor([gt_centers.size(0)]))[0]  # (Total_Pred, M)
-        cost_giou = -giou
-
-        total_cost = (
-                self.cost_weights['cls'] * cost_class +
-                self.cost_weights['center'] * cost_center +
-                self.cost_weights['obj_ness'] * cost_objness +
-                self.cost_weights['giou'] * cost_giou
-        )
+        total_cost, _ = _build_cost_matrix(
+            all_centers, all_sizes, all_cls, all_objness,
+            gt_centers, gt_sizes, gt_labels, self.cost_weights)
 
         pred_indices, gt_indices = linear_sum_assignment(total_cost.cpu().numpy())
         return torch.from_numpy(pred_indices).long().to(all_centers.device), torch.from_numpy(gt_indices).long().to(
@@ -61,25 +91,9 @@ class UnifiedMatcherMoreThanOne(nn.Module):
         if all_objness.dim() == 1:
             all_objness = all_objness.unsqueeze(-1)
 
-        pred_tp_bbox = self._center_size_pred_to_bbox(all_centers, all_sizes)
-        gt_tp_bbox = self._center_size_pred_to_bbox(gt_centers, gt_sizes)
-
-        with torch.no_grad():
-            giou = axis_aligned_bbox_overlaps_3d(pred_tp_bbox.unsqueeze(0), gt_tp_bbox.unsqueeze(0), mode='giou')
-            assert giou.shape[0] == 1
-            giou = giou.squeeze(0)  # (Total_Pred, M)
-
-        cost_class = -all_cls.sigmoid()[:, gt_labels]
-        cost_center = torch.cdist(all_centers, gt_centers, p=1)
-        cost_objness = -all_objness.sigmoid()
-        cost_giou = -giou
-
-        total_cost = (
-                self.cost_weights['cls'] * cost_class +
-                self.cost_weights['center'] * cost_center +
-                self.cost_weights['obj_ness'] * cost_objness +
-                self.cost_weights['giou'] * cost_giou
-        )
+        total_cost, giou = _build_cost_matrix(
+            all_centers, all_sizes, all_cls, all_objness,
+            gt_centers, gt_sizes, gt_labels, self.cost_weights)
 
         pred_indices, gt_indices = linear_sum_assignment(total_cost.cpu().numpy())
         pred_indices = torch.from_numpy(pred_indices).long().to(all_centers.device)

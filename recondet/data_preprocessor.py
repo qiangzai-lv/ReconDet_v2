@@ -216,7 +216,11 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
         if 'depth' in inputs.keys():
             batch_inputs['depth'] = inputs['depth']
 
-        keys_to_check = ['lightpos', 'nerf_sizes', 'denorm_images', 'raydirs', 'c2w', 'intrinsic', 'pose_matrix', 'axis_align_matrix', 'avg_distance', 'scene_scale']
+        keys_to_check = [
+            'lightpos', 'nerf_sizes', 'denorm_images', 'raydirs', 'c2w',
+            'intrinsic', 'pose_matrix', 'axis_align_matrix', 'avg_distance',
+            'gt_camera_extrinsics', 'gt_camera_intrinsics'
+        ]
 
         for key in keys_to_check:
             if key in inputs.keys():

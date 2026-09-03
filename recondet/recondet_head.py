@@ -132,6 +132,9 @@ class ReconDetHead(BaseModule):
         for center_head in self.center_heads:
             nn.init.constant_(center_head.layers[-1].weight, 0.)
             nn.init.constant_(center_head.layers[-1].bias, 0.)
+        for size_head in self.size_heads:
+            nn.init.constant_(size_head.layers[-1].weight, 0.)
+            nn.init.constant_(size_head.layers[-1].bias, 0.)
         self.scales = nn.ModuleList([Scale(1.) for _ in range(n_levels)])
 
     def forward(self, x, batch_inputs_dict, refined_query_xyz=None,

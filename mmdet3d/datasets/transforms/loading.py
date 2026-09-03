@@ -593,7 +593,8 @@ class LoadPointsFromFile(BaseTransform):
                  use_color: bool = False,
                  norm_intensity: bool = False,
                  norm_elongation: bool = False,
-                 backend_args: Optional[dict] = None) -> None:
+                 backend_args: Optional[dict] = None,
+                 data_root=None) -> None:
         self.shift_height = shift_height
         self.use_color = use_color
         if isinstance(use_dim, int):
@@ -608,6 +609,7 @@ class LoadPointsFromFile(BaseTransform):
         self.norm_intensity = norm_intensity
         self.norm_elongation = norm_elongation
         self.backend_args = backend_args
+        self.data_root = data_root
 
     def _load_points(self, pts_filename: str) -> np.ndarray:
         """Private function to load point clouds data.
@@ -642,7 +644,11 @@ class LoadPointsFromFile(BaseTransform):
 
                 - points (:obj:`BasePoints`): Point clouds data.
         """
-        pts_file_path = results['lidar_points']['lidar_path']
+        if self.data_root is None:
+            pts_file_path = results['lidar_points']['lidar_path']
+        else:
+            pts_file_path = self.data_root + '/points/' + results['lidar_points']['lidar_path']
+
         points = self._load_points(pts_file_path)
         points = points.reshape(-1, self.load_dim)
         points = points[:, self.use_dim]
@@ -693,7 +699,6 @@ class LoadPointsFromFile(BaseTransform):
         repr_str += f'norm_intensity={self.norm_intensity})'
         repr_str += f'norm_elongation={self.norm_elongation})'
         return repr_str
-
 
 @TRANSFORMS.register_module()
 class LoadPointsFromDict(LoadPointsFromFile):

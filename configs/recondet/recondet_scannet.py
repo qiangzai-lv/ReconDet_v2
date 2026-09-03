@@ -12,27 +12,17 @@ resume = False
 
 data_root = '/root/shared-nvme/data/ScanNet_processed'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
-grounding_dino_config = 'configs/gdino/grounding_dino_swin-t_pretrain_obj365.py'
-grounding_dino_checkpoint = '/root/shared-nvme/code/Recondet_v7/work_dirs/grounding_dino_swin-t_fine_tune_scannet/epoch_4.pth'
-grounding_dino_classes = [
-    'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
-    'picture', 'counter', 'desk', 'curtain', 'refrigerator', 'shower curtain',
-    'toilet', 'sink', 'bathtub', 'garbage bin'
-]
+vggt_scene_scale_file = f'{data_root}/vggt_scene_scales.pkl'
 
 custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
 
 env_cfg = dict(dist_cfg=dict(backend=_dist_backend_))
 
 _token_dim_ = 512
-_decoder_layer_num = 4
+_decoder_layer_num = 8
 model = dict(
     type='ReconDet',
     vggt_omega_checkpoint=vggt_omega_checkpoint,
-    grounding_dino_config=grounding_dino_config,
-    grounding_dino_checkpoint=grounding_dino_checkpoint,
-    semantic_classes=grounding_dino_classes,
-    grounding_dino_print_score_thr=0.3,
     data_preprocessor=dict(
         type='VGGTDetDataPreprocessor',
         bgr_to_rgb=True,
@@ -74,17 +64,20 @@ model = dict(
         matcher='one2more',
         matcher_iou_thres=0.1,
         matcher_max_dynamic_samples=5,
-        loss_layer_ids=list(range(_decoder_layer_num)),
-        size_logit_range=(-10.0, 10.0)
+        loss_layer_ids=list(range(_decoder_layer_num))
     ),
-    num_queries=256,
+    num_queries=900,
     token_dim=_token_dim_,
     test_only_last_layer=True,
-    enable_detection_loss=True,
-    reconstruction_query_score_thr=0.1,
     if_mix_precision=True,
-    debug_projection_vis=False,
-    debug_projection_vis_interval=10,
+    use_multi_layers=True,
+    if_simpler_project=True,
+    if_use_pred_pc_query=True,
+    if_use_atten_sample=False,
+    atten_sample_ratio=10,
+    if_use_atten_fps=True,
+    lambda_dist=0.8,
+    if_task_query=False,
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)
 )
@@ -99,11 +92,11 @@ class_names = [
 ]
 
 train_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'scene_scale'
 ]
 
 test_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'scene_scale'
 ]
 
 input_modality = dict(
@@ -116,30 +109,48 @@ input_modality = dict(
 train_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
-        type='MultiViewPipeline',
+        type='MultiViewPipeline_Tgt',
         n_images=42,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ],
-        loading='random'
+        mean=[123.675, 116.28, 103.53],
+        std=[58.395, 57.12, 57.375],
+        margin=10,
+        depth_range=[0.5, 5.5],  # for what purpose?
+        loading='gap',
+        nerf_target_views=2,
+        tgt_transforms=[
+            dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
+            dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
+        ]
     ),
-    dict(type='LoadFirstFramePose'),
+    dict(type='LoadVGGTSceneScaleAndPose', scale_file=vggt_scene_scale_file),
     dict(type='PackNeRFDetInputs', keys=train_collect_keys)
 ]
 
 test_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
-        type='MultiViewPipeline',
-        n_images=128,
+        type='MultiViewPipeline_Tgt',
+        n_images=81,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ],
-        loading='uniform'
+        mean=[123.675, 116.28, 103.53],
+        std=[58.395, 57.12, 57.375],
+        margin=10,
+        depth_range=[0.5, 5.5],
+        loading='random',
+        nerf_target_views=1,
+        tgt_transforms=[
+            dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
+            dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
+        ]
     ),
-    dict(type='LoadFirstFramePose'),
+    dict(type='LoadVGGTSceneScaleAndPose', scale_file=vggt_scene_scale_file),
     dict(type='PackNeRFDetInputs', keys=test_collect_keys)
 ]
 
@@ -180,21 +191,13 @@ val_dataloader = dict(
         metainfo=dict(CLASSES=class_names)))
 test_dataloader = val_dataloader
 
-val_evaluator = [
-    dict(type='IndoorMetric', prefix='3d'),
-    dict(type='Indoor2DMetric', iou_thr=[0.5], prefix='2d'),
-    dict(
-        type='ReconstructionMetric',
-        iou_thr=0.5,
-        distance_thresholds=(0.10, 0.25, 0.50),
-        prefix='recon_view'),
-]
+val_evaluator = [dict(type='IndoorMetric')]
 test_evaluator = val_evaluator
 
 # train cfg
 _warm_epoch = 0
 _max_epoch = 200
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=1)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=2)
 test_cfg = dict()
 val_cfg = dict()
 
@@ -220,12 +223,7 @@ param_scheduler = [
 ]
 
 default_hooks = dict(
-    checkpoint=dict(
-        type='CheckpointHook',
-        save_best=['2d/mAP_0.5'],
-        rule='greater',
-        interval=1,
-        max_keep_ckpts=4),
+    checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule="greater", interval=2, max_keep_ckpts=4),
     logger=dict(type='LoggerHook', interval=10)
 )
 

@@ -5,6 +5,9 @@ _base_ = [
 
 load_from = '/root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
 
+data_root = '/root/shared-nvme/data/ScanNet_processed/'
+scannet_ann_root = '/root/shared-nvme/data/scannet_coco/'
+
 lang_model_name = '/root/shared-nvme/data/pretrain/bert-base-uncased'
 
 model = dict(
@@ -127,7 +130,7 @@ train_pipeline = [
     dict(type='RandomFlip', prob=0.5),
     dict(
         type='FixScaleResize',
-        scale=(800, 1333),
+        scale=(448, 448),
         keep_ratio=True,
         backend='pillow'),
     dict(type='FilterAnnotations', min_gt_bbox_wh=(1e-2, 1e-2)),
@@ -144,7 +147,7 @@ test_pipeline = [
         imdecode_backend='pillow'),
     dict(
         type='FixScaleResize',
-        scale=(800, 1333),
+        scale=(448, 448),
         keep_ratio=True,
         backend='pillow'),
     dict(type='LoadAnnotations', with_bbox=True),
@@ -156,8 +159,7 @@ test_pipeline = [
 ]
 
 dataset_type = 'CocoDataset'
-data_root = '/root/shared-nvme/data/ScanNet_processed/'
-scannet_ann_root = '/root/shared-nvme/data/scannet_coco/'
+
 metainfo = dict(classes=(
     'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window',
     'bookshelf', 'picture', 'counter', 'desk', 'curtain', 'refrigerator',

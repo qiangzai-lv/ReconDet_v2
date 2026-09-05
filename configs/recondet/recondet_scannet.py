@@ -1,27 +1,26 @@
 _base_ = ['../_base_/default_runtime.py']
-
-import torch
-
-try:
-    import torch_npu  # noqa: F401
-    _dist_backend_ = 'hccl' if torch.npu.is_available() else 'nccl'
-except ImportError:
-    _dist_backend_ = 'nccl'
-
-resume = False
+custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
 
 data_root = '/root/shared-nvme/data/ScanNet_processed'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
 
-custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
-
-env_cfg = dict(dist_cfg=dict(backend=_dist_backend_))
+grounding_dino_config = 'configs/gdino/grounding_dino_swin-t_pretrain_obj365.py'
+grounding_dino_checkpoint = '/root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'
+grounding_dino_classes = [
+    'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
+    'picture', 'counter', 'desk', 'curtain', 'refrigerator', 'shower curtain',
+    'toilet', 'sink', 'bathtub', 'garbage bin'
+]
 
 _token_dim_ = 512
 _decoder_layer_num = 8
 model = dict(
     type='ReconDet',
     vggt_omega_checkpoint=vggt_omega_checkpoint,
+    g_dino_cfg=dict(
+        grounding_dino_config=grounding_dino_config,
+        grounding_dino_checkpoint=grounding_dino_checkpoint,
+        semantic_classes=grounding_dino_classes),
     data_preprocessor=dict(
         type='VGGTDetDataPreprocessor',
         bgr_to_rgb=True,

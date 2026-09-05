@@ -11,6 +11,7 @@ from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.device import autocast, get_device
 from recondet.geometry_attention import GeometryAwareDeformableDecoder
+from recondet.grounding_dino_encoder import GroundingDINOSemanticEncoder
 from vggt_omega.models import VGGTOmega
 
 device = get_device()
@@ -25,13 +26,13 @@ class ReconDet(Base3DDetector):
             test_cfg: OptConfigType = None,
             data_preprocessor: OptConfigType = None,
             init_cfg: OptConfigType = None,
+            g_dino_cfg: OptConfigType = None,
             decoder_cfg: OptConfigType = None,
             num_queries=128,
             token_dim=1024,
             test_only_last_layer=True,
             position_embedding="fourier",
             if_mix_precision=False,
-            if_save_vggt_feature=False,
             vggt_omega_checkpoint=None,
             deformable_num_points=4,
             query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
@@ -57,6 +58,13 @@ class ReconDet(Base3DDetector):
 
         self.vggt_encoder.eval()
 
+        # gdino encoder
+        self.semantic_encoder = GroundingDINOSemanticEncoder(
+            config=g_dino_cfg['grounding_dino_config'],
+            checkpoint=g_dino_cfg['grounding_dino_checkpoint'],
+            classes=g_dino_cfg['semantic_classes'])
+
+        # detection decoder
         self.decoder = GeometryAwareDeformableDecoder(
             embed_dims=token_dim,
             num_layers=decoder_cfg['dec_nlayers'],
@@ -91,7 +99,6 @@ class ReconDet(Base3DDetector):
             hidden_use_bias=True,
         )
         self.if_mix_precision = if_mix_precision
-        self.if_save_vggt_feature = if_save_vggt_feature
 
         query_xyz_range = torch.as_tensor(query_xyz_range, dtype=torch.float32)
         query_xyz_range = query_xyz_range.reshape(2, 3)

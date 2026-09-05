@@ -63,9 +63,9 @@ class GroundingDINOSemanticEncoder(nn.Module):
                        self.model.bbox_head):
             for parameter in module.parameters():
                 parameter.requires_grad = True
-        if self.model.reconstruction_decoder is not None:
-            for parameter in self.model.reconstruction_decoder.parameters():
-                parameter.requires_grad = True
+        # if self.model.reconstruction_decoder is not None:
+        #     for parameter in self.model.reconstruction_decoder.parameters():
+        #         parameter.requires_grad = True
         self.model.eval()
 
         self.classes = tuple(classes)

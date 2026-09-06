@@ -55,3 +55,16 @@ SHARD_START=0 \
 SHARD_END=4 \
 SPLIT=train \
 bash tools/generate_scannet_2d_all_shards.sh
+
+
+PYTHON_BIN=/root/miniforge3/bin/python \
+$PYTHON_BIN utils/sample_scannet_2d_coco.py \
+  --input /root/shared-nvme/data/scannet_coco_v2/keypoints_bbox_train.json \
+  --output /root/shared-nvme/data/scannet_coco_v2/keypoints_bbox_train_20views.json \
+  --images-per-scene 20
+
+PYTHON_BIN=/root/miniforge3/bin/python \
+$PYTHON_BIN utils/sample_scannet_2d_coco.py \
+  --input /root/shared-nvme/data/scannet_coco_v2/keypoints_bbox_val.json \
+  --output /root/shared-nvme/data/scannet_coco_v2/keypoints_bbox_val_10views.json \
+  --images-per-scene 10

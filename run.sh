@@ -47,3 +47,11 @@ python utils/add_scannet_3d_instance_metadata.py \
   --input /root/shared-nvme/data/ScanNet_processed_v2/scannet_infos_val_mvod.pkl \
   --output /root/shared-nvme/data/ScanNet_processed_v2/scannet_infos_val_mvod_with_ids.pkl
 
+
+
+PYTHON_BIN=/root/miniforge3/bin/python \
+MAX_PARALLEL=8 \
+SHARD_START=0 \
+SHARD_END=4 \
+SPLIT=train \
+bash tools/generate_scannet_2d_all_shards.sh

@@ -6,9 +6,12 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-/root/shared-nvme/data/ScanNet_processed_v2}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/root/shared-nvme/data/scannet_coco_v2}"
 NUM_VIEWS="${NUM_VIEWS:-50}"
+NUM_SHARDS="${NUM_SHARDS:-1}"
+SHARD_ID="${SHARD_ID:-0}"
 ANN_FILE="${DATA_ROOT}/scannet_infos_val_mvod_with_ids.pkl"
+SCENE_OUTPUT_DIR="${SCENE_OUTPUT_DIR:-${OUTPUT_ROOT}/keypoints_bbox_val_scenes}"
 
-mkdir -p "${OUTPUT_ROOT}"
+mkdir -p "${OUTPUT_ROOT}" "${SCENE_OUTPUT_DIR}"
 
 cd "${REPO_ROOT}"
 if [[ ! -f "${ANN_FILE}" ]]; then
@@ -20,8 +23,9 @@ fi
 exec "${PYTHON_BIN}" utils/scannet_3d_to_coco_bbox.py \
   --data-root "${DATA_ROOT}" \
   --ann-file "${ANN_FILE}" \
-  --output "${OUTPUT_ROOT}/keypoints_bbox_val.json" \
-  --rejections-output "${OUTPUT_ROOT}/keypoints_bbox_val_rejections.json" \
+  --output-dir "${SCENE_OUTPUT_DIR}" \
+  --num-shards "${NUM_SHARDS}" \
+  --shard-id "${SHARD_ID}" \
   --num-views "${NUM_VIEWS}" \
   --sampling uniform \
   --depth-scale 1000 \

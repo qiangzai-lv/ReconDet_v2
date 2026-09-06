@@ -705,6 +705,11 @@ def _scene_id(info: dict) -> str:
     return Path(info['img_paths'][0]).parent.name
 
 
+def scene_output_exists(output_dir: Path, scene_id: str) -> bool:
+    """Return whether a completed per-scene annotation file already exists."""
+    return (Path(output_dir) / f'{scene_id}.json').is_file()
+
+
 def select_scene_shard(data_list, num_shards: int, shard_id: int):
     """Return ``(global_index, scene)`` pairs assigned to one worker."""
     if num_shards <= 0:
@@ -787,6 +792,16 @@ def convert(args: argparse.Namespace) -> None:
 
     for worker_offset, (scene_index, info) in enumerate(selected_scenes):
         scene_started_at = time.perf_counter()
+        scene_id = _scene_id(info)
+        if not scene_id or Path(scene_id).name != scene_id:
+            raise ValueError(f'invalid scene id for output filename: {scene_id!r}')
+        if scene_output_exists(output_dir, scene_id):
+            stats['skipped_scenes'] += 1
+            LOGGER.info(
+                'Skipping existing scene %s (%d/%d): %s', scene_id,
+                worker_offset + 1, len(selected_scenes),
+                output_dir / f'{scene_id}.json')
+            continue
         coco = _empty_coco(categories)
         rejections = []
         image_id = annotation_id = 1
@@ -795,9 +810,6 @@ def convert(args: argparse.Namespace) -> None:
         rng = np.random.default_rng(args.seed + scene_index)
         view_indices = sample_view_indices(
             len(info['img_paths']), args.num_views, args.sampling, rng)
-        scene_id = _scene_id(info)
-        if not scene_id or Path(scene_id).name != scene_id:
-            raise ValueError(f'invalid scene id for output filename: {scene_id!r}')
         LOGGER.info(
             'Scene %d/%d %s: points=%d objects=%d selected_views=%d/%d',
             worker_offset + 1, len(selected_scenes), scene_id, len(points),

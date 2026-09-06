@@ -67,6 +67,7 @@ model = dict(
     bbox_head=dict(
         type='ReconDetHead',
         n_classes=18,
+        text_dim=256,
         n_levels=_decoder_layer_num,
         n_channels=_token_dim_,
         n_reg_outs=6,

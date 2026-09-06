@@ -16,6 +16,8 @@ from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3
 from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
                                         OptConfigType, OptInstanceList)
 from recondet.matcher import UnifiedMatcher, UnifiedMatcherMoreThanOne
+from recondet.text_aligned_classification import (
+    TextAlignedClassificationHead, build_multilabel_targets)
 
 
 @torch.no_grad()
@@ -42,6 +44,7 @@ class ReconDetHead(BaseModule):
                  n_reg_outs: int,
                  pts_assign_threshold: int,
                  pts_center_threshold: int,
+                 text_dim: int = 256,
                  objness_loss: ConfigType = dict(type='mmdet.FocalLoss', use_sigmoid=True),
                  train_cfg: OptConfigType = None,
                  test_cfg: OptConfigType = None,
@@ -66,9 +69,8 @@ class ReconDetHead(BaseModule):
         self.n_reg_outs = n_reg_outs
         self.pts_assign_threshold = pts_assign_threshold
         self.pts_center_threshold = pts_center_threshold
-        class_weights = torch.ones((self.n_classes + 1))
-        class_weights[-1] = loss_weights['not_objness_loss']
-        self.cls_loss = nn.CrossEntropyLoss(weight=class_weights)  # MODELS.build(cls_loss)
+        self.text_dim = int(text_dim)
+        self.cls_loss = nn.BCEWithLogitsLoss()
         self.objness_loss = MODELS.build(objness_loss)
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
@@ -114,16 +116,15 @@ class ReconDetHead(BaseModule):
     def _init_layers(self, n_channels, n_reg_outs, n_classes, n_levels):
         center_head = self.mlp_func(output_dim=3)
         size_head = self.mlp_func(output_dim=3)
-        semcls_head = self.mlp_func(output_dim=n_classes + 1)
         self.center_heads = nn.ModuleList([
             copy.deepcopy(center_head) for _ in range(n_levels)
         ])
         self.size_heads = nn.ModuleList([
             copy.deepcopy(size_head) for _ in range(n_levels)
         ])
-        self.semcls_heads = nn.ModuleList([
-            copy.deepcopy(semcls_head) for _ in range(n_levels)
-        ])
+        self.text_cls_head = TextAlignedClassificationHead(
+            query_dim=n_channels, text_dim=self.text_dim,
+            num_layers=n_levels, normalize=True)
         for center_head in self.center_heads:
             nn.init.constant_(center_head.layers[-1].weight, 0.)
             nn.init.constant_(center_head.layers[-1].bias, 0.)
@@ -144,17 +145,15 @@ class ReconDetHead(BaseModule):
 
         center_preds = []
         size_preds = []
-        cls_preds = []
         for feature, center, size, layer_id in zip(
                 x, refined_query_xyz, refined_query_sizes, layer_ids):
             center_preds.append(center.permute(0, 2, 1))
             size_preds.append(size.permute(0, 2, 1).float())
-            cls_preds.append(self.semcls_heads[layer_id](feature))
-        return center_preds, size_preds, cls_preds
+        return center_preds, size_preds
 
     def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
              batch_inputs_dict: dict, refined_query_xyz=None,
-             refined_query_sizes=None, **kwargs) -> dict:
+             refined_query_sizes=None, text_prototypes=None, **kwargs) -> dict:
         if refined_query_xyz is None or len(refined_query_xyz) != len(x):
             raise ValueError('Loss requires one refined reference per layer')
         if refined_query_sizes is None or len(refined_query_sizes) != len(x):
@@ -167,7 +166,7 @@ class ReconDetHead(BaseModule):
         supervised_sizes = [
             refined_query_sizes[layer_id] for layer_id in layer_ids
         ]
-        center_preds, size_preds, cls_preds = self(
+        center_preds, size_preds = self(
             supervised_features,
             batch_inputs_dict,
             supervised_references,
@@ -188,6 +187,10 @@ class ReconDetHead(BaseModule):
             batch_gt_instances_ignore.append(
                 data_sample.get('ignored_instances', None))
 
+        if text_prototypes is None:
+            raise ValueError('Text prototypes are required for 3D classification')
+        cls_preds = self.text_cls_head(supervised_features, text_prototypes,
+                                       layer_ids)
         loss_inputs = (center_preds, size_preds, cls_preds, layer_ids,
                        batch_gt_instances_3d, batch_input_metas,
                        batch_input_points, batch_gt_instances_ignore)
@@ -254,6 +257,9 @@ class ReconDetHead(BaseModule):
 
         gt_centers = gt_bboxes.gravity_center
         gt_sizes = gt_bboxes.tensor[:, 3:6]
+        if gt_labels.numel() and ((gt_labels < 0).any() or
+                                  (gt_labels >= self.n_classes).any()):
+            raise ValueError('3D GT labels exceed text class range')
 
         all_pred_indices = []
         all_gt_indices = []
@@ -262,8 +268,7 @@ class ReconDetHead(BaseModule):
         for stage_idx in range(len(center_preds)):
             centers, sizes, cls_scores = center_preds[stage_idx].t(), size_preds[stage_idx].t(), cls_preds[
                 stage_idx].t()  # , objness_preds[stage_idx].t()
-            cls_scores_softmax = F.softmax(cls_scores, dim=1)
-            obj_scores = 1.0 - cls_scores_softmax[:, -1]
+            obj_scores = cls_scores.sigmoid().amax(dim=-1)
             n_predictions = centers.size(0)
 
             pred_indices, gt_indices = self.matcher._get_targets(
@@ -284,9 +289,11 @@ class ReconDetHead(BaseModule):
         matched_gt_labels = gt_labels[gt_indices]
         center_loss = F.l1_loss(matched_centers, matched_gt_centers) * self.loss_weights['center_loss']
         size_loss = F.l1_loss(matched_sizes, matched_gt_sizes) * self.loss_weights['size_loss']
-        cls_target = torch.ones((all_centers.shape[0]), device=all_centers.device) * self.n_classes
-        cls_target = cls_target.long()
-        cls_target[pred_indices] = matched_gt_labels
+        cls_target = torch.zeros(
+            all_cls.shape[0], self.n_classes, device=all_cls.device,
+            dtype=all_cls.dtype)
+        if pred_indices.numel() > 0:
+            cls_target[pred_indices, matched_gt_labels] = 1.0
         cls_loss = self.cls_loss(all_cls, cls_target) * self.loss_weights['cls_loss']
         pred_tp_bbox = self._center_size_pred_to_bbox(matched_centers, matched_sizes)
         gt_tp_bbox = self._center_size_pred_to_bbox(matched_gt_centers, matched_gt_sizes)
@@ -299,15 +306,18 @@ class ReconDetHead(BaseModule):
                 x: Tuple[Tensor],
                 batch_data_samples: SampleList, batch_inputs_dict,
                 refined_query_xyz=None, refined_query_sizes=None,
-                layer_ids=None,
+                layer_ids=None, text_prototypes=None,
                 rescale: bool = False) -> InstanceList:
 
         batch_input_metas = [
             data_samples.metainfo for data_samples in batch_data_samples
         ]
-        center_preds, size_preds, cls_preds = self(
+        center_preds, size_preds = self(
             x, batch_inputs_dict, refined_query_xyz,
             refined_query_sizes, layer_ids)
+        if text_prototypes is None:
+            raise ValueError('Text prototypes are required for 3D classification')
+        cls_preds = self.text_cls_head(x, text_prototypes, layer_ids)
         predictions = self.predict_by_feat(
             center_preds, size_preds, cls_preds,
             batch_input_metas=batch_input_metas,
@@ -343,9 +353,7 @@ class ReconDetHead(BaseModule):
         for stage_idx in range(len(center_preds)):
             centers, sizes, cls_scores = center_preds[stage_idx].t(), size_preds[stage_idx].t(), cls_preds[
                 stage_idx].t()
-            cls_scores = F.softmax(cls_scores, dim=1)
-            scores = cls_scores[:, :-1]
-
+            scores = cls_scores.sigmoid()
             max_scores, _ = scores.max(dim=1)
 
             if len(scores) > self.test_cfg.nms_pre > 0:

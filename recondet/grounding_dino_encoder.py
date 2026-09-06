@@ -11,6 +11,7 @@ from torch import nn
 from mmdet.registry import MODELS as MMDET_MODELS
 from mmdet.models.dense_heads.atss_vlfusion_head import (
     convert_grounding_to_cls_scores)
+from recondet.text_aligned_classification import build_class_text_prototypes
 from mmdet.structures import DetDataSample
 from mmdet.utils import register_all_modules
 
@@ -81,6 +82,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
         self.model.eval()
 
         self.token_positive_map = None
+        self._text_class_prototypes = None
         self.print_score_thr = print_score_thr
         self.register_buffer(
             'image_mean',
@@ -129,6 +131,25 @@ class GroundingDINOSemanticEncoder(nn.Module):
             self.model.get_tokens_and_prompts(self.classes, True))
         self.token_positive_map, _ = self.model.get_positive_map(
             tokenized, tokens_positive)
+
+    @torch.no_grad()
+    def get_text_class_prototypes(self, device=None):
+        """Return fixed class prototypes in GroundingDINO text space."""
+        self._ensure_token_positive_map()
+        if self._text_class_prototypes is None:
+            _, caption, _, _ = self.model.get_tokens_and_prompts(
+                self.classes, True)
+            text_dict = self.model.language_model([caption])
+            if self.model.text_feat_map is not None:
+                text_dict['embedded'] = self.model.text_feat_map(
+                    text_dict['embedded'])
+            tokens = text_dict['embedded'][0]
+            self._text_class_prototypes = build_class_text_prototypes(
+                tokens, self.token_positive_map, len(self.classes)).detach()
+        prototypes = self._text_class_prototypes
+        if device is not None:
+            prototypes = prototypes.to(device=device)
+        return prototypes
 
     def _attach_reconstruction_class_scores(self, reconstruction_outputs):
         if reconstruction_outputs is None:

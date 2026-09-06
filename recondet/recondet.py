@@ -99,6 +99,12 @@ class ReconDet(Base3DDetector):
             supervise_confident_query_depth=(
                 supervise_confident_query_depth),
             confident_query_depth_cfg=confident_query_depth_cfg)
+        if self.bbox_head.n_classes != len(self.semantic_encoder.classes):
+            raise ValueError(
+                'ReconDetHead.n_classes must match GroundingDINO semantic_classes')
+        if self.bbox_head.text_dim != self.semantic_encoder.model.embed_dims:
+            raise ValueError(
+                'ReconDetHead.text_dim must match GroundingDINO text feature dimension')
         semantic_query_dims = self.semantic_encoder.model.embed_dims
         self.semantic_query_projection = torch.nn.Linear(
             semantic_query_dims, token_dim)
@@ -408,6 +414,8 @@ class ReconDet(Base3DDetector):
             batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
             refined_query_sizes=refined_query_sizes,
+            text_prototypes=self.semantic_encoder.get_text_class_prototypes(
+                device=img.device),
             **kwargs)
         losses.update({f'recondet_{name}': value
                        for name, value in detection_losses.items()})
@@ -451,6 +459,8 @@ class ReconDet(Base3DDetector):
             refined_query_xyz=refined_query_xyz,
             refined_query_sizes=refined_query_sizes,
             layer_ids=layer_ids,
+            text_prototypes=self.semantic_encoder.get_text_class_prototypes(
+                device=img.device),
             **kwargs)
         predictions = self.add_pred_to_datasample(batch_data_samples,
                                                   results_list)

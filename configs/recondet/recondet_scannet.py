@@ -47,6 +47,13 @@ model = dict(
     reconstruction_depth_loss_weight=5.0,
     reconstruction_point_loss_weight=2.0,
     supervise_camera_head=True,
+    # VGGT-Omega LoRA: choose patch_embed, frame_inter_frame, or all_aggregator.
+    vggt_lora_enable=True,
+    vggt_lora_scope='patch_embed',
+    vggt_lora_rank=8,
+    vggt_lora_alpha=8.0,
+    vggt_lora_dropout=0.1,
+    vggt_lora_renorm=True,
     camera_loss_cfg=dict(
         weight=5.0,
         loss_type='l1',

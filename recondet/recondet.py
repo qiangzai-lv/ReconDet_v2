@@ -23,6 +23,8 @@ from recondet.query_correspondence import (
 from recondet.vggt_camera_loss import (
     compute_vggt_camera_loss, VGGT_CAMERA_LOSS_DEFAULTS)
 from recondet.vggt_ground_truth import mean_point_distance, transform_points
+from recondet.vggt_lora import (
+    configure_vggt_lora, inject_vggt_lora, load_lora_state_dict)
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.pose_enc import encoding_to_camera
 
@@ -55,6 +57,13 @@ class ReconDet(Base3DDetector):
             reconstruction_depth_loss_weight=1.0,
             reconstruction_point_loss_weight=0.5,
             supervise_camera_head=False,
+            vggt_lora_enable=False,
+            vggt_lora_scope='patch_embed',
+            vggt_lora_rank=8,
+            vggt_lora_alpha=8.0,
+            vggt_lora_dropout=0.1,
+            vggt_lora_renorm=True,
+            vggt_lora_checkpoint=None,
             camera_loss_cfg=None,
             supervise_confident_query_depth=False,
             confident_query_depth_cfg=None,
@@ -70,6 +79,25 @@ class ReconDet(Base3DDetector):
         self.vggt_encoder.load_state_dict(
             torch.load(vggt_omega_checkpoint, map_location='cpu', weights_only=True)
         )
+        self.vggt_lora_enable = bool(vggt_lora_enable)
+        self.vggt_lora_scope = str(vggt_lora_scope)
+        self.vggt_lora_rank = int(vggt_lora_rank)
+        self.vggt_lora_alpha = float(vggt_lora_alpha)
+        self.vggt_lora_dropout = float(vggt_lora_dropout)
+        self.vggt_lora_renorm = bool(vggt_lora_renorm)
+        self.vggt_lora_modules = []
+        if self.vggt_lora_enable or vggt_lora_checkpoint is not None:
+            self.vggt_lora_modules = inject_vggt_lora(
+                self.vggt_encoder.aggregator,
+                scope=self.vggt_lora_scope,
+                rank=self.vggt_lora_rank,
+                alpha=self.vggt_lora_alpha,
+                dropout=self.vggt_lora_dropout,
+                renorm=self.vggt_lora_renorm)
+        if vggt_lora_checkpoint is not None:
+            checkpoint = torch.load(vggt_lora_checkpoint, map_location='cpu', weights_only=True)
+            adapter_state = checkpoint.get('lora_state_dict', checkpoint)
+            load_lora_state_dict(self.vggt_encoder.aggregator, adapter_state)
         dense_head = self.vggt_encoder.dense_head
         if self.vggt_encoder.camera_head is None or dense_head is None:
             raise ValueError('VGGT camera and dense heads are required')
@@ -152,7 +180,13 @@ class ReconDet(Base3DDetector):
 
     def _configure_vggt_trainability(self, training):
         self.vggt_encoder.requires_grad_(False)
+        if self.vggt_lora_modules:
+            configure_vggt_lora(
+                self.vggt_encoder.aggregator,
+                enabled=self.vggt_lora_enable)
         self.vggt_encoder.eval()
+        if self.vggt_lora_enable:
+            self.vggt_encoder.aggregator.train(bool(training))
         camera_head = self.vggt_encoder.camera_head
         camera_head.requires_grad_(self.supervise_camera_head)
         camera_head.train(bool(training and self.supervise_camera_head))
@@ -162,17 +196,21 @@ class ReconDet(Base3DDetector):
         self._configure_vggt_trainability(training=mode)
         return self
 
-    @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
                      batch_data_samples: SampleList, mode):
-        with torch.no_grad():
-            # The data preprocessor converts raw BGR uint8 images to RGB without
-            # normalization. VGGT-Omega expects RGB values in [0, 1].
-            img = batch_inputs_dict['imgs'].float().div(255.0)
+        # The data preprocessor converts raw BGR uint8 images to RGB without
+        # normalization. VGGT-Omega expects RGB values in [0, 1].
+        img = batch_inputs_dict['imgs'].float().div(255.0)
+        grad_enabled = bool(self.vggt_lora_enable and self.training)
+        with torch.set_grad_enabled(grad_enabled):
             with autocast(img.device):
                 aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(
                     img)
-                return aggregated_tokens_list, ps_idx, img
+        if not grad_enabled:
+            aggregated_tokens_list = [
+                token.detach() if token is not None else None
+                for token in aggregated_tokens_list]
+        return aggregated_tokens_list, ps_idx, img
 
     def _load_axis_aligned_gt_points(self, metadata):
         lidar_path = Path(metadata['lidar_path'])

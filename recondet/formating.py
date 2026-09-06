@@ -37,6 +37,8 @@ def to_tensor(
         if data.dtype is dtype('float64'):
             data = data.astype(np.float32)
         return torch.from_numpy(data)
+    elif isinstance(data, np.generic):
+        return torch.as_tensor(data.item())
     elif isinstance(data, Sequence) and not mmengine.is_str(data):
         return torch.tensor(data)
     elif isinstance(data, int):
@@ -47,11 +49,25 @@ def to_tensor(
         raise TypeError(f'type {type(data)} cannot be converted to tensor.')
 
 
+def _pack_multiview_2d_instances(view_instances):
+    packed = []
+    for instances in view_instances:
+        packed_instances = InstanceData()
+        for name, value in instances.items():
+            packed_instances[name] = to_tensor(value)
+        packed.append(packed_instances)
+    return packed
+
+
 @TRANSFORMS.register_module()
 class PackNeRFDetInputs(BaseTransform):
     INPUTS_KEYS = ['points', 'img']
     NERF_INPUT_KEYS = [
-        'img', 'denorm_images', 'depth', 'lightpos', 'nerf_sizes', 'raydirs', 'c2w', 'intrinsic', 'points', 'pose_matrix', 'axis_align_matrix', 'avg_distance'
+        'img', 'denorm_images', 'depth', 'lightpos', 'nerf_sizes', 'raydirs',
+        'c2w', 'intrinsic', 'points', 'pose_matrix', 'axis_align_matrix',
+        'avg_distance', 'gt_depths_vggt', 'gt_depth_valid_masks',
+        'gt_scene_points_vggt', 'gt_extrinsics_vggt', 'gt_c2w_vggt',
+        'gt_intrinsics', 'vggt_gt_scale'
     ]
 
     INSTANCEDATA_3D_KEYS = [
@@ -83,7 +99,7 @@ class PackNeRFDetInputs(BaseTransform):
                             'cam2global', 'crop_offset', 'img_crop_offset',
                             'resize_img_shape', 'lidar2cam', 'ori_lidar2img',
                             'num_ref_frames', 'num_views', 'ego2global',
-                            'axis_align_matrix')
+                            'axis_align_matrix', 'view_indices', 'scene_id')
     ) -> None:
         self.keys = keys
         self.meta_keys = meta_keys
@@ -269,12 +285,24 @@ class PackNeRFDetInputs(BaseTransform):
         if 'gt_depths' in results:
             results['gt_depths'] = to_tensor(results['gt_depths'])
 
+        for key in (
+                'gt_depths_vggt', 'gt_depth_valid_masks',
+                'gt_scene_points_vggt', 'gt_extrinsics_vggt',
+                'gt_c2w_vggt', 'gt_intrinsics', 'vggt_gt_scale'):
+            if key in results and not isinstance(results[key], torch.Tensor):
+                results[key] = to_tensor(results[key])
+
         data_sample = NeRFDet3DDataSample()
         gt_instances_3d = InstanceData()
         gt_instances = InstanceData()
         gt_pts_seg = PointData()
         gt_nerf_images = InstanceData()
         gt_nerf_depths = InstanceData()
+        if 'gt_instances_2d' in self.keys:
+            data_sample.set_field(
+                _pack_multiview_2d_instances(
+                    results.get('gt_instances_2d', [])),
+                'gt_instances_2d')
 
         data_metas = {}
         for key in self.meta_keys:
@@ -319,6 +347,8 @@ class PackNeRFDetInputs(BaseTransform):
                         gt_instances['labels'] = results[key]
                     else:
                         gt_instances[self._remove_prefix(key)] = results[key]
+                elif key == 'gt_instances_2d':
+                    continue
                 elif key in self.SEG_KEYS:
                     gt_pts_seg[self._remove_prefix(key)] = results[key]
                 else:

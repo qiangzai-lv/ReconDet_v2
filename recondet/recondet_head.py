@@ -5,7 +5,6 @@ from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
-from mmcv.cnn import Scale
 from mmengine.model import BaseModule
 from mmengine.structures import InstanceData
 from torch import Tensor, nn
@@ -60,7 +59,6 @@ class ReconDetHead(BaseModule):
                  matcher_iou_thres=0.25,
                  matcher_max_dynamic_samples=10,
                  loss_layer_ids=None,
-                 size_logit_range=(-10.0, 10.0),
                  ):
         super(ReconDetHead, self).__init__(init_cfg)
         self.n_classes = n_classes
@@ -104,9 +102,6 @@ class ReconDetHead(BaseModule):
                                                      matcher_max_dynamic_samples=matcher_max_dynamic_samples)
         self.loss_weights = loss_weights
         self.learn_center_diff = learn_center_diff
-        if len(size_logit_range) != 2 or size_logit_range[0] >= size_logit_range[1]:
-            raise ValueError('size_logit_range must be an increasing pair')
-        self.size_logit_range = tuple(float(value) for value in size_logit_range)
         if loss_layer_ids is None:
             loss_layer_ids = list(range(n_levels))
         self.loss_layer_ids = sorted(set(loss_layer_ids))
@@ -132,52 +127,51 @@ class ReconDetHead(BaseModule):
         for center_head in self.center_heads:
             nn.init.constant_(center_head.layers[-1].weight, 0.)
             nn.init.constant_(center_head.layers[-1].bias, 0.)
-        self.scales = nn.ModuleList([Scale(1.) for _ in range(n_levels)])
+        for size_head in self.size_heads:
+            nn.init.constant_(size_head.layers[-1].weight, 0.)
+            nn.init.constant_(size_head.layers[-1].bias, 0.)
 
     def forward(self, x, batch_inputs_dict, refined_query_xyz=None,
-                layer_ids=None):
+                refined_query_sizes=None, layer_ids=None):
         if layer_ids is None:
             layer_ids = list(range(len(x)))
         if len(layer_ids) != len(x):
             raise ValueError('Layer ids must match decoder outputs')
         if refined_query_xyz is None or len(refined_query_xyz) != len(x):
             raise ValueError('Refined references must match decoder outputs')
+        if refined_query_sizes is None or len(refined_query_sizes) != len(x):
+            raise ValueError('Refined sizes must match decoder outputs')
 
         center_preds = []
         size_preds = []
         cls_preds = []
-        for feature, center, layer_id in zip(
-                x, refined_query_xyz, layer_ids):
+        for feature, center, size, layer_id in zip(
+                x, refined_query_xyz, refined_query_sizes, layer_ids):
             center_preds.append(center.permute(0, 2, 1))
-            size_logits = self.scales[layer_id](
-                self.size_heads[layer_id](feature))
-            with torch.autocast(device_type=size_logits.device.type,
-                                enabled=False):
-                size_logits = size_logits.float()
-                bounded_logits = size_logits.clamp(
-                    min=self.size_logit_range[0],
-                    max=self.size_logit_range[1])
-                # Bound the exponential in forward while retaining recovery
-                # gradients for logits that have crossed the stable range.
-                bounded_logits = size_logits + (
-                    bounded_logits - size_logits).detach()
-                size_preds.append(torch.exp(bounded_logits))
+            size_preds.append(size.permute(0, 2, 1).float())
             cls_preds.append(self.semcls_heads[layer_id](feature))
         return center_preds, size_preds, cls_preds
 
     def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
-             batch_inputs_dict: dict, refined_query_xyz=None, **kwargs) -> dict:
+             batch_inputs_dict: dict, refined_query_xyz=None,
+             refined_query_sizes=None, **kwargs) -> dict:
         if refined_query_xyz is None or len(refined_query_xyz) != len(x):
             raise ValueError('Loss requires one refined reference per layer')
+        if refined_query_sizes is None or len(refined_query_sizes) != len(x):
+            raise ValueError('Loss requires one refined size per layer')
         layer_ids = self.loss_layer_ids
         supervised_features = [x[layer_id] for layer_id in layer_ids]
         supervised_references = [
             refined_query_xyz[layer_id] for layer_id in layer_ids
         ]
+        supervised_sizes = [
+            refined_query_sizes[layer_id] for layer_id in layer_ids
+        ]
         center_preds, size_preds, cls_preds = self(
             supervised_features,
             batch_inputs_dict,
             supervised_references,
+            supervised_sizes,
             layer_ids)
 
         if 'points' in batch_inputs_dict.keys():
@@ -304,14 +298,16 @@ class ReconDetHead(BaseModule):
     def predict(self,
                 x: Tuple[Tensor],
                 batch_data_samples: SampleList, batch_inputs_dict,
-                refined_query_xyz=None, layer_ids=None,
+                refined_query_xyz=None, refined_query_sizes=None,
+                layer_ids=None,
                 rescale: bool = False) -> InstanceList:
 
         batch_input_metas = [
             data_samples.metainfo for data_samples in batch_data_samples
         ]
         center_preds, size_preds, cls_preds = self(
-            x, batch_inputs_dict, refined_query_xyz, layer_ids)
+            x, batch_inputs_dict, refined_query_xyz,
+            refined_query_sizes, layer_ids)
         predictions = self.predict_by_feat(
             center_preds, size_preds, cls_preds,
             batch_input_metas=batch_input_metas,
@@ -348,8 +344,7 @@ class ReconDetHead(BaseModule):
             centers, sizes, cls_scores = center_preds[stage_idx].t(), size_preds[stage_idx].t(), cls_preds[
                 stage_idx].t()
             cls_scores = F.softmax(cls_scores, dim=1)
-            objectness = 1 - cls_scores[:, -1]
-            scores = cls_scores[:, :-1] * objectness.unsqueeze(-1)
+            scores = cls_scores[:, :-1]
 
             max_scores, _ = scores.max(dim=1)
 

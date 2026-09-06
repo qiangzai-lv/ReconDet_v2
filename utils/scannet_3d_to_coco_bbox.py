@@ -19,6 +19,7 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
+from scipy.ndimage import minimum_filter
 
 
 LOGGER = logging.getLogger('scannet_3d_to_coco_bbox')
@@ -119,7 +120,7 @@ _PALETTE = (
 
 
 def camera_matrix_for_view(cam2img: np.ndarray, view_index: int) -> np.ndarray:
-    matrices = np.asarray(cam2img, dtype=np.float64)
+    matrices = np.asarray(cam2img, dtype=np.float32)
     if matrices.ndim == 3:
         if not 0 <= view_index < len(matrices):
             raise IndexError(f'view_index {view_index} is outside cam2img')
@@ -136,7 +137,7 @@ def resize_intrinsic(intrinsic: np.ndarray, source_size: Tuple[int, int],
     target_width, target_height = map(float, target_size)
     if source_width <= 0 or source_height <= 0 or target_width <= 0 or target_height <= 0:
         raise ValueError('image sizes must be positive')
-    scaled = np.asarray(intrinsic, dtype=np.float64).copy()
+    scaled = np.asarray(intrinsic, dtype=np.float32).copy()
     if scaled.shape != (3, 3):
         raise ValueError(f'intrinsic must be 3x3, got {scaled.shape}')
     scaled[0] *= target_width / source_width
@@ -160,16 +161,16 @@ def load_depth_map(root: Path, image_path: Path, depth_scale: float = 1000.0) ->
 
 def world_to_camera_from_aligned_pose(
         axis_align: np.ndarray, raw_camera_to_world: np.ndarray) -> np.ndarray:
-    axis_align = np.asarray(axis_align, dtype=np.float64)
-    raw_camera_to_world = np.asarray(raw_camera_to_world, dtype=np.float64)
+    axis_align = np.asarray(axis_align, dtype=np.float32)
+    raw_camera_to_world = np.asarray(raw_camera_to_world, dtype=np.float32)
     if axis_align.shape != (4, 4) or raw_camera_to_world.shape != (4, 4):
         raise ValueError('axis_align and raw_camera_to_world must both be 4x4')
-    return np.linalg.inv(axis_align @ raw_camera_to_world)
+    return np.linalg.inv(axis_align @ raw_camera_to_world).astype(np.float32)
 
 
 def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
-    points = np.asarray(points, dtype=np.float64)
-    transform = np.asarray(transform, dtype=np.float64)
+    points = np.asarray(points, dtype=np.float32)
+    transform = np.asarray(transform, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f'points must have shape Nx3, got {points.shape}')
     if transform.shape not in ((3, 4), (4, 4)):
@@ -182,7 +183,8 @@ def project_points(
         intrinsic: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     camera_points = transform_points(points, world_to_camera)
     depth = camera_points[:, 2]
-    pixels_h = camera_points @ np.asarray(intrinsic, dtype=np.float64)[:3, :3].T
+    intrinsic = np.asarray(intrinsic, dtype=np.float32)
+    pixels_h = camera_points @ intrinsic[:3, :3].T
     with np.errstate(divide='ignore', invalid='ignore'):
         pixels = pixels_h[:, :2] / pixels_h[:, 2:3]
     return pixels, depth
@@ -200,12 +202,12 @@ def points_in_image(
 
 
 def _aabb_corners(box: np.ndarray) -> np.ndarray:
-    center = np.asarray(box, dtype=np.float64)[:3]
-    half_size = np.asarray(box, dtype=np.float64)[3:6] / 2.0
+    center = np.asarray(box, dtype=np.float32)[:3]
+    half_size = np.asarray(box, dtype=np.float32)[3:6] / 2.0
     signs = np.array([
         [-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
         [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1],
-    ], dtype=np.float64)
+    ], dtype=np.float32)
     return center + signs * half_size
 
 
@@ -234,7 +236,7 @@ def project_aabb(
     if not clipped:
         return None
     camera_points = np.asarray(clipped)
-    pixels_h = camera_points @ np.asarray(intrinsic)[:3, :3].T
+    pixels_h = camera_points @ np.asarray(intrinsic, dtype=np.float32)[:3, :3].T
     pixels = pixels_h[:, :2] / pixels_h[:, 2:3]
     pixels = pixels[np.isfinite(pixels).all(axis=1)]
     if not len(pixels):
@@ -258,33 +260,47 @@ def classify_depth_visibility(
     """
     if window_radius < 0:
         raise ValueError('window_radius must be non-negative')
-    pixels = np.asarray(pixels, dtype=np.float64)
-    depth = np.asarray(depth, dtype=np.float64)
-    depth_map = np.asarray(depth_map, dtype=np.float64)
+    pixels = np.asarray(pixels, dtype=np.float32)
+    depth = np.asarray(depth, dtype=np.float32)
+    depth_map = np.asarray(depth_map, dtype=np.float32)
     if depth_map.ndim != 2:
         raise ValueError('depth_map must have shape [H, W]')
     height, width = depth_map.shape
     result = np.full(len(pixels), UNKNOWN, dtype=np.int8)
     valid = ((depth > 1e-4) & np.isfinite(depth)
              & np.isfinite(pixels).all(axis=1))
-    for point_index in np.flatnonzero(valid):
-        x, y = np.rint(pixels[point_index]).astype(np.int64)
-        if x < 0 or x >= width or y < 0 or y >= height:
-            continue
-        x0, x1 = max(0, x - window_radius), min(width, x + window_radius + 1)
-        y0, y1 = max(0, y - window_radius), min(height, y + window_radius + 1)
-        samples = depth_map[y0:y1, x0:x1]
-        samples = samples[np.isfinite(samples) & (samples > 1e-4)]
-        if samples.size == 0:
-            continue
-        tolerance = abs_tolerance + rel_tolerance * depth[point_index]
-        result[point_index] = int(depth[point_index] <= samples.min() + tolerance)
+    valid_indices = np.flatnonzero(valid)
+    rounded = np.rint(pixels[valid_indices]).astype(np.int64)
+    inside = ((rounded[:, 0] >= 0) & (rounded[:, 0] < width)
+              & (rounded[:, 1] >= 0) & (rounded[:, 1] < height))
+    valid_indices = valid_indices[inside]
+    rounded = rounded[inside]
+    if not len(valid_indices):
+        return result
+
+    valid_depth = np.where(
+        np.isfinite(depth_map) & (depth_map > 1e-4),
+        depth_map, np.float32(np.inf))
+    if window_radius:
+        nearest_depth = minimum_filter(
+            valid_depth, size=2 * window_radius + 1,
+            mode='constant', cval=np.inf)
+    else:
+        nearest_depth = valid_depth
+    nearest = nearest_depth[rounded[:, 1], rounded[:, 0]]
+    covered = np.isfinite(nearest)
+    valid_indices = valid_indices[covered]
+    nearest = nearest[covered]
+    tolerance = (np.float32(abs_tolerance)
+                 + np.float32(rel_tolerance) * depth[valid_indices])
+    result[valid_indices] = (
+        depth[valid_indices] <= nearest + tolerance).astype(np.int8)
     return result
 
 
 def assign_scene_points(points: np.ndarray, boxes: np.ndarray) -> PointAssignments:
-    points = np.asarray(points, dtype=np.float64)
-    boxes = np.asarray(boxes, dtype=np.float64)
+    points = np.asarray(points, dtype=np.float32)
+    boxes = np.asarray(boxes, dtype=np.float32)
     if boxes.size == 0:
         return PointAssignments(
             np.zeros((len(points), 0), dtype=bool),
@@ -305,12 +321,12 @@ def visible_points_bbox(
         pixels: np.ndarray, amodal_xyxy: np.ndarray, width: int, height: int,
         padding: float = 2.0) -> Optional[list]:
     """Return one xywh box enclosing all visible projections."""
-    pixels = np.asarray(pixels, dtype=np.float64)
+    pixels = np.asarray(pixels, dtype=np.float32)
     if not len(pixels):
         return None
     lower = pixels.min(axis=0) - padding
     upper = pixels.max(axis=0) + padding
-    amodal = np.asarray(amodal_xyxy, dtype=np.float64)
+    amodal = np.asarray(amodal_xyxy, dtype=np.float32)
     lower = np.maximum(lower, amodal[:2])
     upper = np.minimum(upper, amodal[2:])
     lower = np.maximum(lower, [0.0, 0.0])
@@ -435,6 +451,7 @@ def _build_view_geometry(
         points: np.ndarray, world_to_camera: np.ndarray, intrinsic: np.ndarray,
         width: int, height: int, depth_map: np.ndarray,
         config: GeneratorConfig) -> ViewGeometry:
+    depth_map = np.asarray(depth_map, dtype=np.float32)
     depth_height, depth_width = depth_map.shape
     depth_intrinsic = resize_intrinsic(
         intrinsic, (width, height), (depth_width, depth_height))
@@ -446,11 +463,11 @@ def _build_view_geometry(
         depth_pixels, point_depth, depth_map,
         config.abs_depth_tolerance, config.rel_depth_tolerance,
         config.depth_window_radius)
-    pixels, _ = project_points(points, world_to_camera, intrinsic)
-    in_image = points_in_image(pixels, point_depth, width, height)
-    visibility[in_depth == 0] = UNKNOWN
-    scale = np.asarray([width / depth_width, height / depth_height])
+    visibility[~in_depth] = UNKNOWN
+    scale = np.asarray(
+        [width / depth_width, height / depth_height], dtype=np.float32)
     pixels = depth_pixels * scale
+    in_image = points_in_image(pixels, point_depth, width, height)
     return ViewGeometry(
         pixels=pixels,
         depth_pixels=depth_pixels,
@@ -473,7 +490,8 @@ def _robust_depth_from_patch(depth_map: np.ndarray, center: np.ndarray,
     right = window_size - left
     x0, x1 = max(0, x - left), min(width, x + right)
     y0, y1 = max(0, y - left), min(height, y + right)
-    values = depth_map[y0:y1, x0:x1].astype(np.float64).reshape(-1)
+    values = np.asarray(
+        depth_map[y0:y1, x0:x1], dtype=np.float32).reshape(-1)
     values = values[np.isfinite(values) & (values > 1e-4)]
     if not len(values):
         return None
@@ -493,8 +511,8 @@ def _backproject_depth_pixel(pixel: np.ndarray, depth: float,
         (pixel[0] - cx) * depth / fx,
         (pixel[1] - cy) * depth / fy,
         depth,
-    ], dtype=np.float64)
-    transform = np.asarray(world_to_camera, dtype=np.float64)
+    ], dtype=np.float32)
+    transform = np.asarray(world_to_camera, dtype=np.float32)
     rotation = transform[:3, :3]
     translation = transform[:3, 3]
     return (camera_point - translation) @ rotation
@@ -507,10 +525,12 @@ def _estimate_center_geometry(
                                                         Optional[list], int,
                                                         Optional[str]]:
     x, y, box_width, box_height = map(float, bbox)
-    center_rgb = np.array([x + box_width / 2.0, y + box_height / 2.0])
+    center_rgb = np.array(
+        [x + box_width / 2.0, y + box_height / 2.0], dtype=np.float32)
     depth_height, depth_width = geometry.depth_map.shape
     center_depth_pixel = center_rgb * np.array([
-        depth_width / float(width), depth_height / float(height)])
+        depth_width / float(width), depth_height / float(height)],
+        dtype=np.float32)
     depth_box_size = min(
         box_width * depth_width / float(width),
         box_height * depth_height / float(height))
@@ -531,8 +551,8 @@ def _estimate_center_geometry(
     center_point_mask = visible & (near_center <= pixel_radius)
     center_points = points[indices][center_point_mask]
     if len(center_points) >= config.center_min_samples:
-        mean_point = np.mean(center_points.astype(np.float64), axis=0)
-        return (center_depth, mean_point.astype(np.float32).tolist(),
+        mean_point = np.mean(center_points, axis=0, dtype=np.float32)
+        return (center_depth, mean_point.tolist(),
                 int(len(center_points)), 'instance_points')
 
     if center_depth is not None:
@@ -617,8 +637,8 @@ def _process_view(
         width, height = image.size
     depth_map = load_depth_map(root, relative, config.depth_scale)
     world_to_camera = world_to_camera_from_aligned_pose(
-        np.asarray(info['axis_align_matrix'], dtype=np.float64),
-        np.asarray(info['lidar2cam'][view_index]))
+        np.asarray(info['axis_align_matrix'], dtype=np.float32),
+        np.asarray(info['lidar2cam'][view_index], dtype=np.float32))
     intrinsic = camera_matrix_for_view(info['cam2img'], view_index)
     geometry = _build_view_geometry(
         points, world_to_camera, intrinsic, width, height, depth_map, config)

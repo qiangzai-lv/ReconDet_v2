@@ -1,7 +1,9 @@
 _base_ = ['../_base_/default_runtime.py']
 custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
 
-data_root = '/root/shared-nvme/data/ScanNet_processed'
+data_root = '/root/shared-nvme/data/ScanNet_processed_v2'
+scannet_2d_ann_root = '/root/shared-nvme/data/scannet_coco_v2'
+gt_points_dir = f'{data_root}/points'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
 
 grounding_dino_config = 'configs/gdino/grounding_dino_swin-t_pretrain_obj365.py'
@@ -13,7 +15,7 @@ grounding_dino_classes = [
 ]
 
 _token_dim_ = 512
-_decoder_layer_num = 8
+_decoder_layer_num = 4
 model = dict(
     type='ReconDet',
     vggt_omega_checkpoint=vggt_omega_checkpoint,
@@ -22,7 +24,7 @@ model = dict(
         grounding_dino_checkpoint=grounding_dino_checkpoint,
         semantic_classes=grounding_dino_classes),
     data_preprocessor=dict(
-        type='VGGTDetDataPreprocessor',
+        type='ReconDetDataPreprocessor',
         bgr_to_rgb=True,
         pad_size_divisor=16,
         pad_value=0),
@@ -34,7 +36,32 @@ model = dict(
         dec_nlayers=_decoder_layer_num
     ),
     deformable_num_points=4,
+    query_clustering_cfg=dict(
+        num_neighbors=4,
+        class_cost_weight=0.5,
+        query_cost_weight=0.25,
+        min_cluster_size=0.05),
     query_xyz_range=[-6.5, -9.0, -1.0, 6.5, 9.0, 4.5],
+    gt_points_dir=gt_points_dir,
+    supervise_2d_bbox=False,
+    supervise_camera_head=True,
+    camera_loss_cfg=dict(
+        weight=5.0,
+        loss_type='l1',
+        gamma=0.6,
+        weight_trans=1.0,
+        weight_rot=1.0,
+        weight_focal=0.5,
+        min_valid_points=100),
+    supervise_confident_query_depth=True,
+    confident_query_depth_cfg=dict(
+        score_thr=0.05,
+        loss_weight=1.0,
+        window_fraction=0.1,
+        min_window_size=2,
+        max_window_size=4,
+        abs_depth_tolerance=0.05,
+        rel_depth_tolerance=0.01),
     bbox_head=dict(
         type='ReconDetHead',
         n_classes=18,
@@ -63,8 +90,7 @@ model = dict(
         matcher='one2more',
         matcher_iou_thres=0.1,
         matcher_max_dynamic_samples=5,
-        loss_layer_ids=list(range(_decoder_layer_num)),
-        size_logit_range=(-10.0, 10.0)
+        loss_layer_ids=list(range(_decoder_layer_num))
     ),
     num_queries=256,
     token_dim=_token_dim_,
@@ -84,14 +110,26 @@ class_names = [
 ]
 
 train_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_instances_2d',
+    'pose_matrix', 'axis_align_matrix', 'gt_depths_vggt',
+    'gt_depth_valid_masks', 'gt_scene_points_vggt',
+    'gt_extrinsics_vggt', 'gt_c2w_vggt', 'gt_intrinsics',
+    'vggt_gt_scale'
 ]
 
 test_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix',
+    'axis_align_matrix'
 ]
 
-input_modality = dict(
+train_input_modality = dict(
+    use_camera=True,
+    use_depth=True,
+    use_lidar=False,
+    use_neuralrecon_depth=False,
+    use_ray=False)
+
+test_input_modality = dict(
     use_camera=True,
     use_depth=False,
     use_lidar=False,
@@ -107,8 +145,14 @@ train_pipeline = [
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ],
-        loading='random'
+        loading='random',
+        depth_scale=1000.0
     ),
+    dict(
+        type='BuildVGGTGroundTruth',
+        points_root=gt_points_dir,
+        num_point_features=6,
+        max_depth=30.0),
     dict(type='LoadFirstFramePose'),
     dict(type='PackNeRFDetInputs', keys=train_collect_keys)
 ]
@@ -139,9 +183,10 @@ train_dataloader = dict(
         dataset=dict(
             type=dataset_type,
             data_root=data_root,
-            ann_file='scannet_infos_train_pts.pkl',
+            ann_file='scannet_infos_train_mvod.pkl',
+            ann_file_2d=f'{scannet_2d_ann_root}/keypoints_bbox_train.json',
             pipeline=train_pipeline,
-            modality=input_modality,
+            modality=train_input_modality,
             test_mode=False,
             filter_empty_gt=True,
             box_type_3d='Depth',
@@ -156,9 +201,9 @@ val_dataloader = dict(
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file='scannet_infos_val_pts.pkl',
+        ann_file='scannet_infos_val_mvod.pkl',
         pipeline=test_pipeline,
-        modality=input_modality,
+        modality=test_input_modality,
         test_mode=True,
         filter_empty_gt=True,
         box_type_3d='Depth',

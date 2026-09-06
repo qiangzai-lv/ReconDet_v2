@@ -17,7 +17,12 @@ from mmdet3d.registry import MODELS
 
 
 @MODELS.register_module()
-class VGGTDetDataPreprocessor(DetDataPreprocessor):
+class ReconDetDataPreprocessor(DetDataPreprocessor):
+
+    VGGT_GT_INPUT_KEYS = (
+        'gt_depths_vggt', 'gt_depth_valid_masks',
+        'gt_scene_points_vggt', 'gt_extrinsics_vggt',
+        'gt_c2w_vggt', 'gt_intrinsics', 'vggt_gt_scale')
 
     def __init__(self,
                  batch_first: bool = True,
@@ -34,7 +39,7 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
                  boxtype2tensor: bool = True,
                  non_blocking: bool = False,
                  batch_augments: Optional[List[dict]] = None) -> None:
-        super(VGGTDetDataPreprocessor, self).__init__(
+        super(ReconDetDataPreprocessor, self).__init__(
             mean=mean,
             std=std,
             pad_size_divisor=pad_size_divisor,
@@ -49,6 +54,19 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
             non_blocking=non_blocking,
             batch_augments=batch_augments)
         self.batch_first = batch_first
+
+    def _move_multiview_instances(self, data_samples):
+        if data_samples is None:
+            return
+        for data_sample in data_samples:
+            view_instances = getattr(data_sample, 'gt_instances_2d', None)
+            if view_instances is None:
+                continue
+            data_sample.gt_instances_2d = [
+                instances.to(
+                    self.device, non_blocking=self._non_blocking)
+                for instances in view_instances
+            ]
 
     def forward(self,
                 data: Union[dict, List[dict]],
@@ -102,6 +120,37 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
                     imgs, data_samples = batch_aug(imgs, data_samples)
             batch_inputs['imgs'] = imgs  #
 
+        target_shape = (
+            tuple(batch_inputs['imgs'].shape[-2:])
+            if 'imgs' in batch_inputs else None)
+        for key in self.VGGT_GT_INPUT_KEYS:
+            if key not in inputs:
+                continue
+            value = inputs[key]
+            if isinstance(value, (list, tuple)):
+                tensors = list(value)
+                if key in ('gt_depths_vggt', 'gt_depth_valid_masks'):
+                    if target_shape is None:
+                        raise ValueError(
+                            f'{key} requires images for spatial padding')
+                    padded = []
+                    for tensor in tensors:
+                        pad_h = target_shape[0] - tensor.shape[-2]
+                        pad_w = target_shape[1] - tensor.shape[-1]
+                        if pad_h < 0 or pad_w < 0:
+                            raise ValueError(
+                                f'{key} is larger than the padded images')
+                        padded.append(F.pad(
+                            tensor, (0, pad_w, 0, pad_h),
+                            mode='constant', value=0))
+                    tensors = padded
+                try:
+                    value = torch.stack(tensors)
+                except RuntimeError as error:
+                    raise ValueError(
+                        f'Cannot batch {key}; sample shapes differ') from error
+            batch_inputs[key] = value
+
         if 'depth' in inputs.keys():
             batch_inputs['depth'] = inputs['depth']
 
@@ -130,6 +179,7 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
     def collate_data(self, data: dict) -> dict:
 
         data = self.cast_data(data)  # type: ignore put on gpu
+        self._move_multiview_instances(data.get('data_samples'))
 
         if 'img' in data['inputs']:
             _batch_imgs = data['inputs']['img']

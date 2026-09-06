@@ -1,13 +1,182 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from dataclasses import dataclass
+import json
 import warnings
 from os import path as osp
-from typing import Callable, List, Optional, Union
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
 from mmdet3d.datasets import Det3DDataset
 from mmdet3d.registry import DATASETS
 from mmdet3d.structures import DepthInstance3DBoxes
+
+
+def _normalise_image_key(value: Union[str, Path], data_root: Optional[Path] = None) -> str:
+    path = Path(str(value))
+    if path.is_absolute() and data_root is not None:
+        try:
+            path = path.relative_to(data_root)
+        except ValueError:
+            pass
+    return path.as_posix().lstrip('./')
+
+
+@dataclass(frozen=True)
+class ScanNet2DAnnotationIndex:
+    by_image_key: Dict[Tuple[str, str], list]
+    images_by_view: Dict[Tuple[str, int], dict]
+    annotations_by_image_id: Dict[int, list]
+    category_id_to_name: Dict[int, str]
+
+
+def load_scannet_2d_annotation_index(
+        ann_file: Union[str, Path],
+        data_root: Optional[Union[str, Path]] = None
+        ) -> ScanNet2DAnnotationIndex:
+    """Load generated COCO boxes and index them by scene and image path."""
+    root = Path(data_root).resolve() if data_root is not None else None
+    with Path(ann_file).open('r', encoding='utf-8') as handle:
+        payload = json.load(handle)
+
+    by_image_key: Dict[Tuple[str, str], list] = {}
+    images_by_view: Dict[Tuple[str, int], dict] = {}
+    image_records = {}
+    category_id_to_name = {
+        int(category['id']): str(category['name'])
+        for category in payload.get('categories', [])
+        if 'id' in category and 'name' in category
+    }
+    for image in payload.get('images', []):
+        if 'id' not in image or 'file_name' not in image:
+            raise ValueError('2D image records require id and file_name')
+        scene_id = str(image.get(
+            'scene_id', Path(image['file_name']).parent.name))
+        image_id = int(image['id'])
+        record = dict(image)
+        record['scene_id'] = scene_id
+        record['image_id'] = image_id
+        record['file_name'] = _normalise_image_key(
+            image['file_name'], root)
+        image_records[image_id] = record
+        key = (scene_id, record['file_name'])
+        if key in by_image_key:
+            raise ValueError(f'duplicate 2D image key: {key}')
+        by_image_key[key] = []
+        if 'view_index' in image:
+            view_key = (scene_id, int(image['view_index']))
+            if view_key in images_by_view:
+                raise ValueError(f'duplicate 2D view key: {view_key}')
+            images_by_view[view_key] = record
+
+    annotations_by_image_id: Dict[int, list] = {
+        image_id: [] for image_id in image_records}
+    seen_instance_keys = set()
+    for annotation in payload.get('annotations', []):
+        if 'image_id' not in annotation or 'instance_id_3d' not in annotation:
+            raise ValueError(
+                '2D annotations require image_id and instance_id_3d')
+        image_id = int(annotation['image_id'])
+        if image_id not in image_records:
+            raise ValueError(f'annotation references unknown image_id {image_id}')
+        instance_id = int(annotation['instance_id_3d'])
+        duplicate_key = (image_id, instance_id)
+        if duplicate_key in seen_instance_keys:
+            raise ValueError(
+                f'duplicate 2D annotation for image/instance {duplicate_key}')
+        seen_instance_keys.add(duplicate_key)
+        if 'bbox' not in annotation or len(annotation['bbox']) != 4:
+            raise ValueError(f'invalid bbox for annotation {annotation.get("id")}')
+        record = dict(annotation)
+        record['image_id'] = image_id
+        record['instance_id_3d'] = instance_id
+        record['image_width'] = image_records[image_id].get('width')
+        record['image_height'] = image_records[image_id].get('height')
+        annotations_by_image_id[image_id].append(record)
+
+    for image_id, records in annotations_by_image_id.items():
+        image = image_records[image_id]
+        by_image_key[(image['scene_id'], image['file_name'])].extend(records)
+    return ScanNet2DAnnotationIndex(
+        by_image_key, images_by_view, annotations_by_image_id,
+        category_id_to_name)
+
+
+def build_view_2d_instances(
+        records: list,
+        scale_factor: Tuple[float, float],
+        img_shape: Tuple[int, int],
+        min_bbox_wh: Tuple[float, float] = (1e-2, 1e-2),
+        category_id_to_label: Optional[Dict[int, int]] = None) -> dict:
+    """Apply GroundingDINO's absolute xyxy resize/filter contract."""
+    height, width = map(int, img_shape)
+    x_scale, y_scale = map(float, scale_factor)
+    if height <= 0 or width <= 0 or x_scale <= 0 or y_scale <= 0:
+        raise ValueError('invalid image shape or scale factor for 2D boxes')
+    boxes = []
+    labels = []
+    instance_ids = []
+    centers = []
+    depths = []
+    visible_ratios = []
+    for record in records:
+        x, y, box_width, box_height = map(float, record['bbox'])
+        if box_width < 1.0 or box_height < 1.0:
+            continue
+        if float(record.get('area', box_width * box_height)) <= 0:
+            continue
+        image_width = record.get('image_width')
+        image_height = record.get('image_height')
+        if image_width is not None and image_height is not None:
+            inter_width = max(
+                0.0, min(x + box_width, float(image_width)) - max(x, 0.0))
+            inter_height = max(
+                0.0, min(y + box_height, float(image_height)) - max(y, 0.0))
+            if inter_width * inter_height == 0:
+                continue
+        box = np.asarray(
+            [x, y, x + box_width, y + box_height], dtype=np.float32)
+        box *= np.asarray([x_scale, y_scale, x_scale, y_scale], dtype=np.float32)
+        box[[0, 2]] = np.clip(box[[0, 2]], 0.0, float(width))
+        box[[1, 3]] = np.clip(box[[1, 3]], 0.0, float(height))
+        if (box[2] - box[0] <= min_bbox_wh[0]
+                or box[3] - box[1] <= min_bbox_wh[1]):
+            continue
+        category_id = int(record['category_id'])
+        if 'bbox_label' in record:
+            label = int(record['bbox_label'])
+        elif category_id_to_label is None:
+            label = category_id - 1
+        else:
+            if category_id not in category_id_to_label:
+                raise ValueError(f'unknown 2D category_id {category_id}')
+            label = category_id_to_label[category_id]
+        center = record.get('center_3d')
+        if center is None:
+            center = [np.nan, np.nan, np.nan]
+        if len(center) != 3:
+            raise ValueError(
+                f'center_3d must have three values for instance '
+                f'{record["instance_id_3d"]}')
+        boxes.append(box)
+        labels.append(label)
+        instance_ids.append(int(record['instance_id_3d']))
+        centers.append(center)
+        center_depth = record.get('center_depth')
+        visible_ratio = record.get('visible_point_ratio')
+        depths.append(float(
+            np.nan if center_depth is None else center_depth))
+        visible_ratios.append(float(
+            np.nan if visible_ratio is None else visible_ratio))
+    return {
+        'bboxes': np.asarray(boxes, dtype=np.float32).reshape(-1, 4),
+        'labels': np.asarray(labels, dtype=np.int64),
+        'instance_ids_3d': np.asarray(instance_ids, dtype=np.int64),
+        'centers_3d': np.asarray(centers, dtype=np.float32).reshape(-1, 3),
+        'center_depth': np.asarray(depths, dtype=np.float32),
+        'visible_ratios': np.asarray(visible_ratios, dtype=np.float32),
+    }
 
 
 @DATASETS.register_module()
@@ -23,6 +192,7 @@ class MultiViewScanNetDataset(Det3DDataset):
     def __init__(self,
                  data_root: str,
                  ann_file: str,
+                 ann_file_2d: Optional[str] = None,
                  metainfo: Optional[dict] = None,
                  pipeline: List[Union[dict, Callable]] = [],
                  modality: dict = dict(use_camera=True, use_lidar=False),
@@ -33,6 +203,15 @@ class MultiViewScanNetDataset(Det3DDataset):
                  **kwargs) -> None:
 
         self.remove_dontcare = remove_dontcare
+        self._ann_file_2d = ann_file_2d
+        if ann_file_2d is None:
+            self._2d_annotation_index = None
+        else:
+            annotation_path = Path(ann_file_2d)
+            if not annotation_path.is_absolute():
+                annotation_path = Path(data_root) / annotation_path
+            self._2d_annotation_index = load_scannet_2d_annotation_index(
+                annotation_path, data_root)
 
         super().__init__(
             data_root=data_root,
@@ -62,6 +241,13 @@ class MultiViewScanNetDataset(Det3DDataset):
 
     def parse_data_info(self, info: dict) -> dict:
 
+        scene_id = str(info.get(
+            'scene_id', Path(info['img_paths'][0]).parent.name))
+        info['scene_id'] = scene_id
+        info['lidar_path'] = str(
+            Path(self.data_root) / 'points' / f'{scene_id}.bin')
+        info['num_pts_feats'] = int(info.get('num_pts_feats', 6))
+
         if self.modality['use_depth']:
             info['depth_info'] = []
         if self.modality['use_neuralrecon_depth']:
@@ -74,6 +260,8 @@ class MultiViewScanNetDataset(Det3DDataset):
                 '`MultiViewPipeline` to support lidar processing')
 
         info['axis_align_matrix'] = self._get_axis_align_matrix(info)
+        if self._2d_annotation_index is not None:
+            info['ann_info_2d'] = self._parse_2d_annotations(info)
         info['img_info'] = []
         info['lidar2img'] = []
         info['c2w'] = []
@@ -89,8 +277,11 @@ class MultiViewScanNetDataset(Det3DDataset):
                     info['depth_info'].append(
                         dict(filename=img_filename[:-4] + '.npy'))
                 else:
+                    image_path = Path(img_filename)
                     info['depth_info'].append(
-                        dict(filename=img_filename[:-4] + '.png'))
+                        dict(filename=str(
+                            image_path.parent / 'depth' /
+                            f'{image_path.stem}.png')))
             # implement lidar_info in input.keys() in the future.
             extrinsic = np.linalg.inv(
                 info['axis_align_matrix'] @ info['lidar2cam'][i])
@@ -118,6 +309,36 @@ class MultiViewScanNetDataset(Det3DDataset):
             info['eval_ann_info'] = self._remove_dontcare(info['ann_info'])
 
         return info
+
+    def _parse_2d_annotations(self, info: dict) -> list:
+        index = self._2d_annotation_index
+        scene_id = str(info.get(
+            'scene_id', Path(info['img_paths'][0]).parent.name))
+        annotations_by_view = []
+        for view_index, image_path in enumerate(info['img_paths']):
+            key = (scene_id, _normalise_image_key(image_path,
+                                                   Path(self.data_root).resolve()))
+            records = index.by_image_key.get(key)
+            if records is None:
+                image = index.images_by_view.get((scene_id, view_index))
+                records = (index.annotations_by_image_id.get(
+                    image['image_id'], []) if image is not None else [])
+            parsed_records = []
+            for record in records:
+                category_id = int(record['category_id'])
+                category_name = index.category_id_to_name.get(category_id)
+                if category_name is None:
+                    raise ValueError(
+                        f'2D category_id {category_id} is missing from categories')
+                classes = tuple(self.metainfo['classes'])
+                if category_name not in classes:
+                    raise ValueError(
+                        f'2D category {category_name!r} is not in ScanNet classes')
+                parsed = dict(record)
+                parsed['bbox_label'] = classes.index(category_name)
+                parsed_records.append(parsed)
+            annotations_by_view.append(parsed_records)
+        return annotations_by_view
 
     def parse_ann_info(self, info: dict) -> dict:
 

@@ -1,3 +1,5 @@
+import copy
+
 import torch
 import torch.nn as nn
 
@@ -9,7 +11,7 @@ class VGGTFeatureProjector(nn.Module):
         super().__init__()
         self.patch_size = dense_head.patch_size
         self.intermediate_layer_idx = dense_head.intermediate_layer_idx
-        self.norm = dense_head.norm
+        self.norm = copy.deepcopy(dense_head.norm)
         self.output_projects = nn.ModuleList([
             nn.Conv2d(
                 in_channels=dim_in,

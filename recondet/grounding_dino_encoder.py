@@ -9,6 +9,8 @@ from mmengine.structures import InstanceData
 from torch import nn
 
 from mmdet.registry import MODELS as MMDET_MODELS
+from mmdet.models.dense_heads.atss_vlfusion_head import (
+    convert_grounding_to_cls_scores)
 from mmdet.structures import DetDataSample
 from mmdet.utils import register_all_modules
 
@@ -20,10 +22,17 @@ class GroundingDINOSemanticEncoder(nn.Module):
                  config: str,
                  checkpoint: str,
                  classes: Sequence[str],
-                 print_score_thr: float = 0.3) -> None:
+                 print_score_thr: float = 0.3,
+                 supervise_2d_bbox: bool = True,
+                 supervise_confident_query_depth: bool = False,
+                 confident_query_depth_cfg=None) -> None:
         super().__init__()
         if not classes:
             raise ValueError('GroundingDINO classes must not be empty.')
+        self.classes = tuple(classes)
+        self.supervise_2d_bbox = bool(supervise_2d_bbox)
+        self.supervise_confident_query_depth = bool(
+            supervise_confident_query_depth)
         config_path = Path(config).expanduser()
         if not config_path.is_absolute():
             config_path = Path.cwd() / config_path
@@ -35,6 +44,11 @@ class GroundingDINOSemanticEncoder(nn.Module):
         image_std = data_preprocessor_cfg['std']
         if model_cfg.get('backbone', {}).get('init_cfg') is not None:
             model_cfg.backbone.init_cfg = None
+        model_cfg.bbox_head.supervise_confident_query_depth = (
+            self.supervise_confident_query_depth)
+        model_cfg.bbox_head.supervise_2d_bbox = self.supervise_2d_bbox
+        model_cfg.bbox_head.confident_query_depth_cfg = (
+            confident_query_depth_cfg)
 
         register_all_modules(init_default_scope=False)
         self.model = MMDET_MODELS.build(model_cfg)
@@ -57,18 +71,10 @@ class GroundingDINOSemanticEncoder(nn.Module):
         load_state_dict(self.model, state_dict, strict=False)
         self.model._is_init = True
 
-        for parameter in self.model.parameters():
-            parameter.requires_grad = False
-        for module in (self.model.query_embedding, self.model.decoder,
-                       self.model.bbox_head):
-            for parameter in module.parameters():
-                parameter.requires_grad = True
-        # if self.model.reconstruction_decoder is not None:
-        #     for parameter in self.model.reconstruction_decoder.parameters():
-        #         parameter.requires_grad = True
+        self._configure_model_trainability()
         self.model.eval()
 
-        self.classes = tuple(classes)
+        self.token_positive_map = None
         self.print_score_thr = print_score_thr
         self.register_buffer(
             'image_mean',
@@ -79,13 +85,58 @@ class GroundingDINOSemanticEncoder(nn.Module):
             torch.tensor(image_std).view(1, 3, 1, 1),
             persistent=False)
 
+    def _configure_model_trainability(self):
+        self.model.requires_grad_(False)
+        if self.supervise_2d_bbox:
+            for module in (self.model.query_embedding, self.model.decoder,
+                           self.model.bbox_head):
+                module.requires_grad_(True)
+        reconstruction_decoder = self.model.reconstruction_decoder
+        if reconstruction_decoder is not None:
+            reconstruction_decoder.requires_grad_(True)
+        self.model.bbox_head.reconstruction_head.requires_grad_(True)
+
     def train(self, mode: bool = True):
         super().train(mode)
+        if not self.supervise_2d_bbox:
+            # GroundingDINO checks its root ``training`` flag to construct
+            # the encoder/denoising metadata consumed by bbox_head.loss.
+            # Keep that control flow while all frozen detector children stay
+            # in eval mode.
+            for module in self.model.children():
+                module.eval()
+            reconstruction_decoder = self.model.reconstruction_decoder
+            if reconstruction_decoder is not None:
+                reconstruction_decoder.train(mode)
+            self.model.bbox_head.reconstruction_head.train(mode)
+            return self
         for module_name in ('backbone', 'neck', 'encoder', 'language_model'):
             module = getattr(self.model, module_name, None)
             if module is not None:
                 module.eval()
         return self
+
+    def _ensure_token_positive_map(self):
+        if self.token_positive_map is not None:
+            return
+        tokenized, _, tokens_positive, _ = (
+            self.model.get_tokens_and_prompts(self.classes, True))
+        self.token_positive_map, _ = self.model.get_positive_map(
+            tokenized, tokens_positive)
+
+    def _attach_reconstruction_class_scores(self, reconstruction_outputs):
+        if reconstruction_outputs is None:
+            raise RuntimeError('Reconstruction outputs are not available')
+        self._ensure_token_positive_map()
+        query_count = reconstruction_outputs['reconstruction_query'].shape[1]
+        token_scores = self.model.bbox_head._last_cls_scores[
+            -1, :, -query_count:].sigmoid()
+        positive_maps = [self.token_positive_map] * len(token_scores)
+        class_scores = convert_grounding_to_cls_scores(
+            token_scores, positive_maps)
+        reconstruction_outputs['class_scores_2d'] = class_scores
+        reconstruction_outputs['foreground_score'] = class_scores.amax(dim=-1)
+        return reconstruction_outputs
 
     @staticmethod
     def _image_shape(data_sample, view_index: int, fallback):
@@ -130,46 +181,57 @@ class GroundingDINOSemanticEncoder(nn.Module):
         return flattened
 
     def _make_training_samples(self, batch_data_samples, num_views,
-                               padded_shape):
-        image_height, image_width = padded_shape
+                               padded_shape, gt_depths_vggt=None,
+                               gt_depth_valid_masks=None,
+                               vggt_gt_scale=None):
+        supervise_confident_depth = getattr(
+            self, 'supervise_confident_query_depth', False)
+        if supervise_confident_depth:
+            if (gt_depths_vggt is None or gt_depth_valid_masks is None
+                    or vggt_gt_scale is None):
+                raise RuntimeError(
+                    'Confident query depth supervision requires VGGT depth, '
+                    'valid masks, and scale')
+            expected_prefix = (len(batch_data_samples), num_views)
+            if gt_depths_vggt.shape[:2] != expected_prefix:
+                raise ValueError('GT depth shape must begin with [B, V]')
+            if gt_depth_valid_masks.shape != gt_depths_vggt.shape:
+                raise ValueError('GT depth masks must match GT depth maps')
+            if vggt_gt_scale.shape != (len(batch_data_samples),):
+                raise ValueError('VGGT GT scale must have shape [B]')
         samples = []
-        for source_sample in batch_data_samples:
-            source_instances = source_sample.gt_instances_3d
-            # 3D ScanNet annotations use ``labels_3d``. GroundingDINO's
-            # per-view samples require the generic 2D ``labels`` field.
-            source_labels = getattr(source_instances, 'labels_3d', None)
-            if source_labels is None:
-                source_labels = getattr(source_instances, 'labels', None)
-            if source_labels is None:
-                boxes_3d = getattr(source_instances, 'bboxes_3d', None)
-                num_boxes = len(boxes_3d) if boxes_3d is not None else 0
-                label_device = getattr(boxes_3d, 'device', None)
-                if label_device is None:
-                    label_device = getattr(boxes_3d, 'tensor', None)
-                    label_device = getattr(label_device, 'device', None)
-                source_labels = torch.zeros(
-                    (num_boxes,), dtype=torch.long,
-                    device=label_device)
+        for batch_index, source_sample in enumerate(batch_data_samples):
+            source_instances_2d = getattr(
+                source_sample, 'gt_instances_2d', None)
+            if source_instances_2d is None:
+                raise RuntimeError(
+                    'ReConDet training requires per-view gt_instances_2d')
+            if len(source_instances_2d) != num_views:
+                raise ValueError(
+                    'gt_instances_2d view count does not match input images: '
+                    f'{len(source_instances_2d)} != {num_views}')
             for view_index in range(num_views):
                 sample = self._make_data_sample(
                     source_sample, view_index, padded_shape)
-                instances = InstanceData()
-                bboxes = source_instances.bboxes_2d
-                if bboxes.ndim == 3:
-                    bboxes = bboxes[:, view_index]
-                bbox_visible = source_instances.bboxes_2d_visible
-                if bbox_visible.ndim == 2:
-                    bbox_visible = bbox_visible[:, view_index]
-                bbox_size = bboxes[:, 2:] - bboxes[:, :2]
-                valid = bbox_visible.bool()
-                valid &= torch.isfinite(bboxes).all(dim=-1)
-                valid &= (bbox_size > 0).all(dim=-1)
-
-                instances.labels = source_labels[valid].clone()
-                instances.bboxes_2d = bboxes[valid]
-                instances.bboxes = bboxes[valid] * bboxes.new_tensor(
-                    [image_width, image_height, image_width, image_height])
-                instances.centers_3d = source_instances.centers_3d[valid]
+                if supervise_confident_depth:
+                    sample.gt_depth_vggt = gt_depths_vggt[
+                        batch_index, view_index]
+                    sample.gt_depth_valid_mask = gt_depth_valid_masks[
+                        batch_index, view_index]
+                    sample.vggt_gt_scale = vggt_gt_scale[batch_index]
+                    sample.token_positive_map = self.token_positive_map
+                source_instances = source_instances_2d[view_index]
+                instances = InstanceData(
+                    bboxes=source_instances.bboxes,
+                    labels=source_instances.labels,
+                    centers_3d=source_instances.centers_3d,
+                    centers_3d_vggt=source_instances.centers_3d_vggt,
+                    center_depth_vggt=source_instances.center_depth_vggt,
+                    center_3d_valid_mask=(
+                        source_instances.center_3d_valid_mask),
+                    center_depth_valid_mask=(
+                        source_instances.center_depth_valid_mask),
+                    instance_ids_3d=source_instances.instance_ids_3d)
                 sample.gt_instances = instances
                 samples.append(sample)
         return samples
@@ -185,13 +247,19 @@ class GroundingDINOSemanticEncoder(nn.Module):
         return normalized
 
     def loss(self, images, batch_data_samples, vggt_feature_maps=None,
-             return_reconstruction=False):
+             vggt_extrinsics=None, vggt_intrinsics=None,
+             return_reconstruction=False, gt_depths_vggt=None,
+             gt_depth_valid_masks=None, vggt_gt_scale=None):
         batch_size, num_views = images.shape[:2]
         padded_shape = images.shape[-2:]
 
         normalized = self._normalize_images(images, batch_data_samples)
+        self._ensure_token_positive_map()
         samples = self._make_training_samples(
-            batch_data_samples, num_views, padded_shape)
+            batch_data_samples, num_views, padded_shape,
+            gt_depths_vggt=gt_depths_vggt,
+            gt_depth_valid_masks=gt_depth_valid_masks,
+            vggt_gt_scale=vggt_gt_scale)
         flattened_vggt_features = None
         if vggt_feature_maps is not None:
             flattened_vggt_features = [
@@ -199,11 +267,25 @@ class GroundingDINOSemanticEncoder(nn.Module):
                     batch_size * num_views, *feature.shape[2:]).contiguous()
                 for feature in vggt_feature_maps
             ]
+        flattened_extrinsics = None
+        flattened_intrinsics = None
+        if vggt_extrinsics is not None and vggt_intrinsics is not None:
+            flattened_extrinsics = vggt_extrinsics.reshape(
+                batch_size * num_views, *vggt_extrinsics.shape[2:]).contiguous()
+            flattened_intrinsics = vggt_intrinsics.reshape(
+                batch_size * num_views, *vggt_intrinsics.shape[2:]).contiguous()
+        image_shapes = normalized.new_tensor([
+            sample.metainfo['img_shape'] for sample in samples])
         result = self.model.loss(
             normalized,
             samples,
             vggt_feature_maps=flattened_vggt_features,
+            vggt_extrinsics=flattened_extrinsics,
+            vggt_intrinsics=flattened_intrinsics,
+            image_shapes=image_shapes,
             return_reconstruction=return_reconstruction)
+        if return_reconstruction:
+            self._attach_reconstruction_class_scores(result[2])
         self._reshape_semantic_feature_maps(batch_size, num_views)
         return result
 
@@ -261,9 +343,11 @@ class GroundingDINOSemanticEncoder(nn.Module):
 
     @torch.no_grad()
     def predict_reconstruction(self, images, batch_data_samples,
-                               vggt_feature_maps):
+                               vggt_feature_maps, vggt_extrinsics,
+                               vggt_intrinsics):
         padded_shape = images.shape[-2:]
         batch_size, num_views = images.shape[:2]
+        self._ensure_token_positive_map()
         flattened = self._normalize_images(images, batch_data_samples)
         samples = []
         for source_sample in batch_data_samples:
@@ -275,13 +359,23 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 batch_size * num_views, *feature.shape[2:]).contiguous()
             for feature in vggt_feature_maps
         ]
+        flattened_extrinsics = vggt_extrinsics.reshape(
+            batch_size * num_views, *vggt_extrinsics.shape[2:]).contiguous()
+        flattened_intrinsics = vggt_intrinsics.reshape(
+            batch_size * num_views, *vggt_intrinsics.shape[2:]).contiguous()
+        image_shapes = flattened.new_tensor([
+            sample.metainfo['img_shape'] for sample in samples])
         was_training = self.model.training
         self.model.eval()
         view_predictions = self.model.predict(
             flattened, samples, rescale=False,
-            vggt_feature_maps=flattened_vggt_features)
+            vggt_feature_maps=flattened_vggt_features,
+            vggt_extrinsics=flattened_extrinsics,
+            vggt_intrinsics=flattened_intrinsics,
+            image_shapes=image_shapes)
         self._reshape_semantic_feature_maps(batch_size, num_views)
         reconstruction_outputs = self.model._last_reconstruction_outputs
+        self._attach_reconstruction_class_scores(reconstruction_outputs)
         if was_training:
-            self.model.train()
+            self.train()
         return reconstruction_outputs, view_predictions

@@ -1,9 +1,14 @@
 _base_ = [
-    '../_base_/datasets/coco_detection.py',
-    '../_base_/schedules/schedule_1x.py', '../_base_/default_runtime.py'
+    '../_base_mmdet_/datasets/coco_detection.py',
+    '../_base_mmdet_/schedules/schedule_1x.py', '../_base_mmdet_/default_runtime.py'
 ]
-pretrained = 'https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth'  # noqa
-lang_model_name = 'bert-base-uncased'
+
+load_from = '/root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
+
+data_root = '/root/shared-nvme/data/ScanNet_processed_v2/'
+scannet_ann_root = '/root/shared-nvme/data/scannet_coco_v2/'
+
+lang_model_name = '/root/shared-nvme/data/pretrain/bert-base-uncased'
 
 model = dict(
     type='GroundingDINO',
@@ -43,7 +48,7 @@ model = dict(
         with_cp=True,
         convert_weights=True,
         frozen_stages=-1,
-        init_cfg=dict(type='Pretrained', checkpoint=pretrained)),
+        init_cfg=None),
     neck=dict(
         type='ChannelMapper',
         in_channels=[192, 384, 768],
@@ -123,42 +128,11 @@ train_pipeline = [
     dict(type='LoadAnnotations', with_bbox=True),
     dict(type='RandomFlip', prob=0.5),
     dict(
-        type='RandomChoice',
-        transforms=[
-            [
-                dict(
-                    type='RandomChoiceResize',
-                    scales=[(480, 1333), (512, 1333), (544, 1333), (576, 1333),
-                            (608, 1333), (640, 1333), (672, 1333), (704, 1333),
-                            (736, 1333), (768, 1333), (800, 1333)],
-                    keep_ratio=True)
-            ],
-            [
-                dict(
-                    type='RandomChoiceResize',
-                    # The radio of all image in train dataset < 7
-                    # follow the original implement
-                    scales=[(400, 4200), (500, 4200), (600, 4200)],
-                    keep_ratio=True),
-                dict(
-                    type='RandomCrop',
-                    crop_type='absolute_range',
-                    crop_size=(384, 600),
-                    allow_negative_crop=True),
-                dict(
-                    type='RandomChoiceResize',
-                    scales=[(480, 1333), (512, 1333), (544, 1333), (576, 1333),
-                            (608, 1333), (640, 1333), (672, 1333), (704, 1333),
-                            (736, 1333), (768, 1333), (800, 1333)],
-                    keep_ratio=True)
-            ]
-        ]),
+        type='FixScaleResize',
+        scale=(448, 448),
+        keep_ratio=True,
+        backend='pillow'),
     dict(type='FilterAnnotations', min_gt_bbox_wh=(1e-2, 1e-2)),
-    dict(
-        type='RandomSamplingNegPos',
-        tokenizer_name=lang_model_name,
-        num_sample_negative=85,
-        max_tokens=256),
     dict(
         type='PackDetInputs',
         meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
@@ -172,7 +146,7 @@ test_pipeline = [
         imdecode_backend='pillow'),
     dict(
         type='FixScaleResize',
-        scale=(800, 1333),
+        scale=(448, 448),
         keep_ratio=True,
         backend='pillow'),
     dict(type='LoadAnnotations', with_bbox=True),
@@ -183,32 +157,57 @@ test_pipeline = [
                    'tokens_positive'))
 ]
 
-dataset_type = 'ODVGDataset'
-data_root = 'data/objects365v1/'
+dataset_type = 'CocoDataset'
 
-coco_od_dataset = dict(
-    type=dataset_type,
-    data_root=data_root,
-    ann_file='o365v1_train_odvg.json',
-    label_map_file='o365v1_label_map.json',
-    data_prefix=dict(img='train/'),
-    filter_cfg=dict(filter_empty_gt=False),
-    pipeline=train_pipeline,
-    return_classes=True,
-    backend_args=None)
+metainfo = dict(classes=(
+    'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window',
+    'bookshelf', 'picture', 'counter', 'desk', 'curtain', 'refrigerator',
+    'showercurtrain', 'toilet', 'sink', 'bathtub', 'garbagebin'))
+
+backend_args = None
 
 train_dataloader = dict(
-    _delete_=True,
     batch_size=4,
-    num_workers=4,
+    num_workers=12,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     batch_sampler=dict(type='AspectRatioBatchSampler'),
-    dataset=dict(type='ConcatDataset', datasets=[coco_od_dataset]))
-
+    dataset=dict(
+        type=dataset_type,
+        data_root=data_root,
+        ann_file=scannet_ann_root + 'keypoints_bbox_train.json',
+        data_prefix=dict(img=''),
+        metainfo=metainfo,
+        return_classes=True,
+        filter_cfg=dict(filter_empty_gt=True),
+        pipeline=train_pipeline,
+        backend_args=backend_args))
 val_dataloader = dict(
-    dataset=dict(pipeline=test_pipeline, return_classes=True))
+    batch_size=24,
+    num_workers=12,
+    persistent_workers=True,
+    drop_last=False,
+    sampler=dict(type='DefaultSampler', shuffle=False),
+    dataset=dict(
+        type=dataset_type,
+        data_root=data_root,
+        ann_file=scannet_ann_root + 'keypoints_bbox_val.json',
+        data_prefix=dict(img=''),
+        metainfo=metainfo,
+        return_classes=True,
+        test_mode=True,
+        pipeline=test_pipeline,
+        backend_args=backend_args))
 test_dataloader = val_dataloader
+
+val_evaluator = dict(
+    type='CocoMetric',
+    ann_file=scannet_ann_root + 'keypoints_bbox_val.json',
+    metric='bbox',
+    classwise=True,
+    format_only=False,
+    backend_args=backend_args)
+test_evaluator = val_evaluator
 
 optim_wrapper = dict(
     _delete_=True,
@@ -223,25 +222,29 @@ optim_wrapper = dict(
             'language_model': dict(lr_mult=0.1),
         }))
 
-# learning policy
-max_epochs = 30
+# training schedule for 1x
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=12, val_interval=1)
+val_cfg = dict(type='ValLoop')
+test_cfg = dict(type='TestLoop')
+
+# learning rate
 param_scheduler = [
-    dict(type='LinearLR', start_factor=0.1, by_epoch=False, begin=0, end=1000),
+    dict(
+        type='LinearLR', start_factor=0.001, by_epoch=False, begin=0, end=500),
     dict(
         type='MultiStepLR',
         begin=0,
-        end=max_epochs,
+        end=12,
         by_epoch=True,
-        milestones=[19, 26],
+        milestones=[8, 11],
         gamma=0.1)
 ]
-
-train_cfg = dict(
-    type='EpochBasedTrainLoop', max_epochs=max_epochs, val_interval=1)
 
 # NOTE: `auto_scale_lr` is for automatically scaling LR,
 # USER SHOULD NOT CHANGE ITS VALUES.
 # base_batch_size = (16 GPUs) x (2 samples per GPU)
-auto_scale_lr = dict(base_batch_size=64)
 
-default_hooks = dict(visualization=dict(type='GroundingVisualizationHook'))
+model_wrapper_cfg = dict(
+    type='MMDistributedDataParallel',
+    find_unused_parameters=True,
+    static_graph=True)

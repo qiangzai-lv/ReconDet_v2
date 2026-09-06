@@ -5,13 +5,13 @@ _base_ = [
 
 load_from = '/root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
 
-data_root = '/root/shared-nvme/data/ScanNet_processed/'
-scannet_ann_root = '/root/shared-nvme/data/scannet_coco/'
+data_root = '/root/shared-nvme/data/ScanNet_processed_v2/'
+scannet_ann_root = '/root/shared-nvme/data/scannet_coco_v2/'
 
 lang_model_name = '/root/shared-nvme/data/pretrain/bert-base-uncased'
 
 model = dict(
-    type='GroundingDINO',
+    type='ReconGroundingDINO',
     num_queries=64,
     freeze_modules=['language_model', 'backbone', 'neck'],
     with_box_refine=True,
@@ -93,10 +93,24 @@ model = dict(
             ffn_cfg=dict(
                 embed_dims=256, feedforward_channels=2048, ffn_drop=0.0)),
         post_norm_cfg=None),
+    reconstruction_decoder=dict(
+        query_dims=512,
+        semantic_dims=256,
+        spatial_dims=512,
+        num_layers=6,
+        num_heads=8,
+        feedforward_channels=2048,
+        num_feature_levels=4,
+        num_points=4,
+        dropout=0.0),
     positional_encoding=dict(
         num_feats=128, normalize=True, offset=0.0, temperature=20),
     bbox_head=dict(
-        type='GroundingDINOHead',
+        type='ReconGroundingDINOHead',
+        reconstruction_dims=512,
+        log_depth_range=(-6.0, 6.0),
+        reconstruction_depth_loss_weight=1.0,
+        reconstruction_point_loss_weight=0.5,
         num_classes=256,
         sync_cls_avg_factor=True,
         contrastive_cfg=dict(max_text_len=256, log_scale='auto', bias=True),
@@ -111,7 +125,7 @@ model = dict(
         label_noise_scale=0.5,
         box_noise_scale=1.0,  # 0.4 for DN-DETR
         group_cfg=dict(dynamic=True, num_groups=None,
-                       num_dn_queries=100)),  # TODO: half num_dn_queries
+                       num_dn_queries=10)),  # TODO: half num_dn_queries
     # training and testing settings
     train_cfg=dict(
         assigner=dict(
@@ -176,7 +190,7 @@ train_dataloader = dict(
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=scannet_ann_root + 'keypoints_bbox_train_1000.json',
+        ann_file=scannet_ann_root + 'keypoints_bbox_train.json',
         data_prefix=dict(img=''),
         metainfo=metainfo,
         return_classes=True,
@@ -192,7 +206,7 @@ val_dataloader = dict(
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=scannet_ann_root + 'keypoints_bbox_val_100.json',
+        ann_file=scannet_ann_root + 'keypoints_bbox_val.json',
         data_prefix=dict(img=''),
         metainfo=metainfo,
         return_classes=True,

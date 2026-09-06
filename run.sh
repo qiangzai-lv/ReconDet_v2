@@ -1,1 +1,49 @@
 bash tools/dist_train.sh configs/recondet/recondet_scannet.py 1
+
+
+bash tools_mmdet/dist_train.sh configs/gdino/grounding_dino_swin-t_pretrain_obj365_ori.py 1
+
+bash tools_mmdet/dist_test.sh configs/gdino/grounding_dino_swin-t_pretrain_obj365_ori.py /root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth 1
+
+python utils/scannet_3d_to_coco_bbox.py \
+  --data-root /root/shared-nvme/data/ScanNet_processed_v2 \
+  --ann-file /root/shared-nvme/data/ScanNet_processed_v2/scannet_infos_train_mvod_with_ids.pkl \
+  --output /root/shared-nvme/data/scannet_coco_v2/keypoints_bbox_train.json \
+  --rejections-output /root/shared-nvme/data/scannet_coco_v2/keypoints_bbox_train_rejections.json \
+  --num-views 50 \
+  --sampling uniform \
+  --depth-scale 1000 \
+  --depth-window-radius 1 \
+  --min-visible-points 3 \
+  --min-visible-ratio 0.2 \
+  --bbox-padding 2 \
+  --visualize \
+  --visualization-dir /root/shared-nvme/data/scannet_coco_v2/train_visualizations \
+  --log-level INFO
+
+
+python utils/scannet_3d_to_coco_bbox.py \
+  --data-root /root/shared-nvme/data/ScanNet_processed_v2 \
+  --ann-file /root/shared-nvme/data/ScanNet_processed_v2/scannet_infos_val_mvod_with_ids.pkl \
+  --output /root/shared-nvme/data/scannet_coco_v2/keypoints_bbox_val.json \
+  --rejections-output /root/shared-nvme/data/scannet_coco_v2/keypoints_bbox_val_rejections.json \
+  --num-views 50 \
+  --sampling uniform \
+  --depth-scale 1000 \
+  --depth-window-radius 1 \
+  --min-visible-points 3 \
+  --min-visible-ratio 0.2 \
+  --bbox-padding 2 \
+  --visualize \
+  --visualization-dir /root/shared-nvme/data/scannet_coco_v2/val_visualizations \
+  --log-level INFO
+
+python utils/add_scannet_3d_instance_metadata.py \
+  --input /root/shared-nvme/data/ScanNet_processed_v2/scannet_infos_train_mvod.pkl \
+  --output /root/shared-nvme/data/ScanNet_processed_v2/scannet_infos_train_mvod_with_ids.pkl
+
+
+python utils/add_scannet_3d_instance_metadata.py \
+  --input /root/shared-nvme/data/ScanNet_processed_v2/scannet_infos_val_mvod.pkl \
+  --output /root/shared-nvme/data/ScanNet_processed_v2/scannet_infos_val_mvod_with_ids.pkl
+

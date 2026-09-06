@@ -59,6 +59,7 @@ class ReconDet(Base3DDetector):
             supervise_camera_head=False,
             vggt_lora_enable=False,
             vggt_lora_scope='patch_embed',
+            vggt_lora_layer_indices=None,
             vggt_lora_rank=8,
             vggt_lora_alpha=8.0,
             vggt_lora_dropout=0.1,
@@ -81,6 +82,9 @@ class ReconDet(Base3DDetector):
         )
         self.vggt_lora_enable = bool(vggt_lora_enable)
         self.vggt_lora_scope = str(vggt_lora_scope)
+        self.vggt_lora_layer_indices = (
+            None if vggt_lora_layer_indices is None else
+            tuple(int(index) for index in vggt_lora_layer_indices))
         self.vggt_lora_rank = int(vggt_lora_rank)
         self.vggt_lora_alpha = float(vggt_lora_alpha)
         self.vggt_lora_dropout = float(vggt_lora_dropout)
@@ -93,7 +97,8 @@ class ReconDet(Base3DDetector):
                 rank=self.vggt_lora_rank,
                 alpha=self.vggt_lora_alpha,
                 dropout=self.vggt_lora_dropout,
-                renorm=self.vggt_lora_renorm)
+                renorm=self.vggt_lora_renorm,
+                layer_indices=self.vggt_lora_layer_indices)
         if vggt_lora_checkpoint is not None:
             checkpoint = torch.load(vggt_lora_checkpoint, map_location='cpu', weights_only=True)
             adapter_state = checkpoint.get('lora_state_dict', checkpoint)

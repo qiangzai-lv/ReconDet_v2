@@ -84,24 +84,41 @@ class LoRALinear(nn.Module):
         self.merged = False
 
 
-def _target_names(aggregator: nn.Module, scope: str) -> list[str]:
+def _target_names(aggregator: nn.Module, scope: str,
+                  layer_indices: list[int] | tuple[int, ...] | None) -> list[str]:
     if scope not in LORA_SCOPES:
         raise ValueError(f"Unknown vggt_lora_scope={scope!r}; expected one of {sorted(LORA_SCOPES)}")
+    depth = int(aggregator.depth)
+    if layer_indices is None:
+        selected_layers = list(range(depth))
+    else:
+        selected_layers = sorted(set(int(index) for index in layer_indices))
+        if not selected_layers:
+            raise ValueError('vggt_lora_layer_indices must not be empty')
+        invalid = [index for index in selected_layers
+                   if index < 0 or index >= depth]
+        if invalid:
+            raise ValueError(
+                f'vggt_lora_layer_indices outside [0, {depth - 1}]: {invalid}')
     names: list[str] = []
     if scope in {"patch_embed", "all_aggregator"}:
-        names.extend(f"patch_embed.blocks.{i}.attn.qkv" for i in range(len(aggregator.patch_embed.blocks)))
+        names.extend(
+            f"patch_embed.blocks.{i}.attn.qkv" for i in selected_layers)
     if scope in {"frame", "frame_inter_frame", "frame/inter-frame", "all_aggregator"}:
-        names.extend(f"frame_blocks.{i}.attn.qkv" for i in range(len(aggregator.frame_blocks)))
-        names.extend(f"inter_frame_blocks.{i}.attn.qkv" for i in range(len(aggregator.inter_frame_blocks)))
+        names.extend(f"frame_blocks.{i}.attn.qkv" for i in selected_layers)
+        names.extend(
+            f"inter_frame_blocks.{i}.attn.qkv" for i in selected_layers)
     return names
 
 
 def inject_vggt_lora(aggregator: nn.Module, scope: str, rank: int = 8,
                      alpha: float = 8.0, dropout: float = 0.1,
-                     renorm: bool = True) -> list[str]:
+                     renorm: bool = True,
+                     layer_indices: list[int] | tuple[int, ...] | None = None
+                     ) -> list[str]:
     """Replace selected Omega qkv linears and return injected module names."""
     injected = []
-    for name in _target_names(aggregator, scope):
+    for name in _target_names(aggregator, scope, layer_indices):
         parent_name, child_name = name.rsplit(".", 1)
         parent = aggregator.get_submodule(parent_name)
         current = getattr(parent, child_name)

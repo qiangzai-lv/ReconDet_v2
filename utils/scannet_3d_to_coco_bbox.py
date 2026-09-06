@@ -14,6 +14,7 @@ import json
 import logging
 import pickle
 from pathlib import Path
+import tempfile
 import time
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
@@ -704,10 +705,46 @@ def _scene_id(info: dict) -> str:
     return Path(info['img_paths'][0]).parent.name
 
 
+def select_scene_shard(data_list, num_shards: int, shard_id: int):
+    """Return ``(global_index, scene)`` pairs assigned to one worker."""
+    if num_shards <= 0:
+        raise ValueError('num_shards must be positive')
+    if shard_id < 0 or shard_id >= num_shards:
+        raise ValueError('shard_id must be in [0, num_shards)')
+    return [
+        (index, info) for index, info in enumerate(data_list)
+        if index % num_shards == shard_id
+    ]
+
+
+def _empty_coco(categories):
+    return {
+        'info': {'description':
+                 'ScanNet boxes from visible 3D instance point projections'},
+        'licenses': [], 'images': [], 'annotations': [],
+        'categories': [
+            {'id': label + 1, 'name': name, 'supercategory': 'object'}
+            for name, label in categories],
+    }
+
+
+def _write_json_atomic(path: Path, payload, *, compact: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(
+        payload, separators=(',', ':') if compact else None,
+        indent=None if compact else 2)
+    with tempfile.NamedTemporaryFile(
+            mode='w', encoding='utf-8', dir=path.parent,
+            prefix=f'.{path.name}.', suffix='.tmp', delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write(text)
+    temporary.replace(path)
+
+
 def convert(args: argparse.Namespace) -> None:
     started_at = time.perf_counter()
     root = Path(args.data_root).resolve()
-    output = Path(args.output).resolve()
+    output_dir = Path(args.output_dir).resolve()
     annotation_path = Path(args.ann_file)
     if not annotation_path.is_absolute():
         annotation_path = root / annotation_path
@@ -716,17 +753,11 @@ def convert(args: argparse.Namespace) -> None:
     data_list = payload['data_list']
     if args.max_scenes >= 0:
         data_list = data_list[:args.max_scenes]
+    selected_scenes = select_scene_shard(
+        data_list, args.num_shards, args.shard_id)
     categories = sorted(
         payload['metainfo']['categories'].items(), key=lambda item: item[1])
     category_by_label = {int(label): name for name, label in categories}
-    coco = {
-        'info': {'description':
-                 'ScanNet boxes from visible 3D instance point projections'},
-        'licenses': [], 'images': [], 'annotations': [],
-        'categories': [
-            {'id': label + 1, 'name': name, 'supercategory': 'object'}
-            for name, label in categories],
-    }
     config = GeneratorConfig(
         depth_scale=args.depth_scale,
         abs_depth_tolerance=args.abs_depth_tolerance,
@@ -742,29 +773,34 @@ def convert(args: argparse.Namespace) -> None:
     visualization_root = None
     if args.visualize:
         visualization_root = Path(args.visualization_dir).resolve() \
-            if args.visualization_dir else output.with_name(
-                output.stem + '_visualizations')
+            if args.visualization_dir else output_dir.with_name(
+                output_dir.name + '_visualizations')
         LOGGER.info('Visualization enabled: output=%s', visualization_root)
 
-    rng = np.random.default_rng(args.seed)
     stats = Counter()
-    rejections = []
-    image_id = annotation_id = 1
     visualized_images = 0
     LOGGER.info(
-        'Starting annotation generation: scenes=%d views_per_scene=%d sampling=%s',
-        len(data_list), args.num_views, args.sampling)
+        'Starting annotation generation: assigned_scenes=%d total_scenes=%d '
+        'worker=%d/%d views_per_scene=%d sampling=%s',
+        len(selected_scenes), len(data_list), args.shard_id, args.num_shards,
+        args.num_views, args.sampling)
 
-    for scene_offset, info in enumerate(data_list):
+    for worker_offset, (scene_index, info) in enumerate(selected_scenes):
         scene_started_at = time.perf_counter()
+        coco = _empty_coco(categories)
+        rejections = []
+        image_id = annotation_id = 1
         points = load_axis_aligned_scene_points(root, info)
         objects, _ = _prepare_objects(info, points, category_by_label)
+        rng = np.random.default_rng(args.seed + scene_index)
         view_indices = sample_view_indices(
             len(info['img_paths']), args.num_views, args.sampling, rng)
         scene_id = _scene_id(info)
+        if not scene_id or Path(scene_id).name != scene_id:
+            raise ValueError(f'invalid scene id for output filename: {scene_id!r}')
         LOGGER.info(
             'Scene %d/%d %s: points=%d objects=%d selected_views=%d/%d',
-            scene_offset + 1, len(data_list), scene_id, len(points),
+            worker_offset + 1, len(selected_scenes), scene_id, len(points),
             len(objects), len(view_indices), len(info['img_paths']))
 
         for selected_offset, view_index in enumerate(view_indices):
@@ -820,17 +856,13 @@ def convert(args: argparse.Namespace) -> None:
                     view_counts['visible_points'], view_counts['rejected'],
                     time.perf_counter() - view_started_at)
         stats['scenes'] += 1
+        coco['rejections'] = rejections
+        scene_output = output_dir / f'{scene_id}.json'
+        _write_json_atomic(scene_output, coco, compact=True)
         LOGGER.info('Scene %s complete: images=%d elapsed=%.1fs',
                     scene_id, len(view_indices),
                     time.perf_counter() - scene_started_at)
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(coco, separators=(',', ':')))
-    rejection_output = Path(args.rejections_output) if args.rejections_output \
-        else output.with_name(output.stem + '_rejections.json')
-    rejection_output.write_text(json.dumps(rejections, indent=2))
-    LOGGER.info('Wrote %d annotations to %s', len(coco['annotations']), output)
-    LOGGER.info('Wrote %d rejected candidates to %s', len(rejections), rejection_output)
     if visualization_root is not None:
         LOGGER.info('Wrote %d visualization images to %s',
                     visualized_images, visualization_root)
@@ -842,7 +874,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data-root', required=True)
     parser.add_argument('--ann-file', required=True)
-    parser.add_argument('--output', required=True)
+    parser.add_argument('--output-dir', '--output', dest='output_dir', required=True)
+    parser.add_argument('--num-shards', type=int, default=1)
+    parser.add_argument('--shard-id', type=int, default=0)
     parser.add_argument('--num-views', type=int, default=50)
     parser.add_argument('--sampling', choices=('uniform', 'random'), default='uniform')
     parser.add_argument('--seed', type=int, default=0)
@@ -860,7 +894,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--center-window-min-size', type=int, default=2)
     parser.add_argument('--center-window-max-size', type=int, default=6)
     parser.add_argument('--bbox-padding', type=float, default=2.0)
-    parser.add_argument('--rejections-output')
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument('--visualization-dir')
     parser.add_argument('--visualization-max-images', type=int, default=-1)
@@ -873,6 +906,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.num_shards <= 0:
+        raise ValueError('--num-shards must be positive')
+    if args.shard_id < 0 or args.shard_id >= args.num_shards:
+        raise ValueError('--shard-id must be in [0, num-shards)')
     for field in ('min_visible_points', 'view_log_interval'):
         if getattr(args, field) <= 0:
             raise ValueError(f'--{field.replace("_", "-")} must be positive')

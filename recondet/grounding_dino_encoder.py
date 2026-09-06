@@ -24,6 +24,8 @@ class GroundingDINOSemanticEncoder(nn.Module):
                  classes: Sequence[str],
                  print_score_thr: float = 0.3,
                  supervise_2d_bbox: bool = True,
+                 reconstruction_depth_loss_weight: float = 1.0,
+                 reconstruction_point_loss_weight: float = 0.5,
                  supervise_confident_query_depth: bool = False,
                  confident_query_depth_cfg=None) -> None:
         super().__init__()
@@ -47,6 +49,10 @@ class GroundingDINOSemanticEncoder(nn.Module):
         model_cfg.bbox_head.supervise_confident_query_depth = (
             self.supervise_confident_query_depth)
         model_cfg.bbox_head.supervise_2d_bbox = self.supervise_2d_bbox
+        model_cfg.bbox_head.reconstruction_depth_loss_weight = float(
+            reconstruction_depth_loss_weight)
+        model_cfg.bbox_head.reconstruction_point_loss_weight = float(
+            reconstruction_point_loss_weight)
         model_cfg.bbox_head.confident_query_depth_cfg = (
             confident_query_depth_cfg)
 

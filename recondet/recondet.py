@@ -52,6 +52,8 @@ class ReconDet(Base3DDetector):
             query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
             gt_points_dir=None,
             supervise_2d_bbox=True,
+            reconstruction_depth_loss_weight=1.0,
+            reconstruction_point_loss_weight=0.5,
             supervise_camera_head=False,
             camera_loss_cfg=None,
             supervise_confident_query_depth=False,
@@ -90,6 +92,10 @@ class ReconDet(Base3DDetector):
             checkpoint=g_dino_cfg['grounding_dino_checkpoint'],
             classes=g_dino_cfg['semantic_classes'],
             supervise_2d_bbox=supervise_2d_bbox,
+            reconstruction_depth_loss_weight=(
+                reconstruction_depth_loss_weight),
+            reconstruction_point_loss_weight=(
+                reconstruction_point_loss_weight),
             supervise_confident_query_depth=(
                 supervise_confident_query_depth),
             confident_query_depth_cfg=confident_query_depth_cfg)

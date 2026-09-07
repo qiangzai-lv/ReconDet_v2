@@ -62,10 +62,18 @@ def _tensor(value):
 
 
 def _box_center_size(boxes):
-    tensor = _tensor(getattr(boxes, 'tensor', boxes))
+    gravity_center = getattr(boxes, 'gravity_center', None)
+    if gravity_center is not None:
+        centers = _tensor(gravity_center)
+        tensor = _tensor(getattr(boxes, 'tensor', boxes))
+    else:
+        tensor = _tensor(getattr(boxes, 'tensor', boxes))
+        centers = tensor[:, :3]
     if tensor.ndim != 2 or tensor.shape[1] < 6:
         raise ValueError('3D boxes must have shape [N, >=6]')
-    return tensor[:, :3], tensor[:, 3:6]
+    if centers.ndim != 2 or centers.shape[0] != tensor.shape[0]:
+        raise ValueError('3D box centers must have shape [N, 3]')
+    return centers, tensor[:, 3:6]
 
 
 def transform_aabb_boxes(boxes, axis_align_matrix):
@@ -108,7 +116,16 @@ def save_scene_prediction_visualization(
     # metric coordinate system.  Applying axis_align_matrix here would
     # transform the GT boxes a second time and misalign them with the cloud.
     gt_centers, gt_sizes = _box_center_size(gt_boxes)
+    pred_scores = _tensor(pred_scores).reshape(-1)
+    pred_labels = _tensor(pred_labels).reshape(-1)
+    pred_keep = np.isfinite(pred_scores) & (pred_scores > float(score_threshold))
     pred_centers, pred_sizes = _box_center_size(pred_boxes)
+    if len(pred_centers) != len(pred_keep):
+        raise ValueError('pred_boxes and pred_scores must have the same length')
+    pred_centers = pred_centers[pred_keep]
+    pred_sizes = pred_sizes[pred_keep]
+    pred_scores = pred_scores[pred_keep]
+    pred_labels = pred_labels[pred_keep]
     for center, size in zip(gt_centers, gt_sizes):
         _append_box(parts, colors, center, size, (40, 220, 70), box_line_step)
     for center, size in zip(pred_centers, pred_sizes):
@@ -124,7 +141,7 @@ def save_scene_prediction_visualization(
     ply_path = output_dir / 'prediction_overlay.ply'
     write_binary_ply(ply_path, np.concatenate(parts), np.concatenate(colors))
     labels_gt = _tensor(gt_labels).astype(np.int64).tolist()
-    labels_pred = _tensor(pred_labels).astype(np.int64).tolist()
+    labels_pred = pred_labels.astype(np.int64).tolist()
     metadata = {
         'scene_id': str(scene_id),
         'coordinate_system': 'axis_aligned_metric',
@@ -136,7 +153,7 @@ def save_scene_prediction_visualization(
         'pred_boxes': [{'label': int(label), 'category': class_names[int(label)]
                         if 0 <= int(label) < len(class_names) else 'unknown',
                         'score': float(score)}
-                       for label, score in zip(labels_pred, _tensor(pred_scores).tolist())],
+                       for label, score in zip(labels_pred, pred_scores.tolist())],
         'reconstruction_query_count': int(len(recon)),
         'gt_point_bounds': {
             'min': gt_points.min(axis=0).tolist(),
@@ -157,5 +174,69 @@ def save_scene_prediction_visualization(
         'ply': str(ply_path),
     }
     json_path = output_dir / 'prediction_overlay.json'
+    json_path.write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+    return ply_path, json_path
+
+
+def save_scene_cluster_visualization(
+        output_dir, scene_id, gt_points, reconstruction_points,
+        reconstruction_scores, cluster_centers, cluster_sizes,
+        score_threshold=0.1, box_line_step=0.03, max_points=200000):
+    """Write reconstruction queries and scene-level clusters as a PLY overlay."""
+    output_dir = Path(output_dir) / str(scene_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    gt_points = np.asarray(gt_points, dtype=np.float32)
+    if gt_points.ndim != 2 or gt_points.shape[1] < 3:
+        raise ValueError('gt_points must have shape [N, >=3]')
+    gt_points = gt_points[:, :3]
+    if len(gt_points) > max_points:
+        ids = np.linspace(0, len(gt_points) - 1, max_points).astype(np.int64)
+        gt_points = gt_points[ids]
+
+    queries = _tensor(reconstruction_points).reshape(-1, 3)
+    scores = _tensor(reconstruction_scores).reshape(-1)
+    keep = np.isfinite(queries).all(axis=1) & np.isfinite(scores)
+    keep &= scores > float(score_threshold)
+    queries = queries[keep]
+    scores = scores[keep]
+    centers = _tensor(cluster_centers).reshape(-1, 3)
+    sizes = _tensor(cluster_sizes).reshape(-1, 3)
+    if len(centers) != len(sizes):
+        raise ValueError('cluster_centers and cluster_sizes must have same length')
+    valid_clusters = np.isfinite(centers).all(axis=1)
+    valid_clusters &= np.isfinite(sizes).all(axis=1) & (sizes > 0).all(axis=1)
+    centers = centers[valid_clusters]
+    sizes = sizes[valid_clusters]
+
+    parts = [gt_points, queries]
+    colors = [
+        np.full_like(gt_points, (150, 150, 150), dtype=np.uint8),
+        np.full_like(queries, (40, 120, 255), dtype=np.uint8),
+    ]
+    if len(centers):
+        parts.append(centers)
+        colors.append(np.full_like(centers, (255, 220, 30), dtype=np.uint8))
+        for center, size in zip(centers, sizes):
+            _append_box(parts, colors, center, size, (255, 220, 30),
+                        box_line_step)
+
+    ply_path = output_dir / 'cluster_overlay.ply'
+    write_binary_ply(ply_path, np.concatenate(parts), np.concatenate(colors))
+    metadata = {
+        'scene_id': str(scene_id),
+        'coordinate_system': 'axis_aligned_metric',
+        'score_threshold': float(score_threshold),
+        'colors': {
+            'scene_points': 'gray',
+            'reconstruction_query': 'blue',
+            'cluster_center_and_extent': 'yellow',
+        },
+        'reconstruction_query_count': int(len(queries)),
+        'cluster_count': int(len(centers)),
+        'cluster_centers': centers.tolist(),
+        'cluster_sizes': sizes.tolist(),
+        'ply': str(ply_path),
+    }
+    json_path = output_dir / 'cluster_overlay.json'
     json_path.write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     return ply_path, json_path

@@ -10,7 +10,7 @@ from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
 from recondet.camera_alignment import (
     denormalize_vggt_gt_cameras, denormalize_vggt_gt_points,
-    load_axis_aligned_points, normalize_query_points)
+    load_axis_aligned_points)
 from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.device import autocast, get_device
@@ -22,7 +22,8 @@ from recondet.query_correspondence import (
 from recondet.vggt_camera_loss import (
     compute_vggt_camera_loss, VGGT_CAMERA_LOSS_DEFAULTS)
 from recondet.vggt_ground_truth import mean_point_distance, transform_points
-from recondet.prediction_visualization import save_scene_prediction_visualization
+from recondet.prediction_visualization import (
+    save_scene_cluster_visualization, save_scene_prediction_visualization)
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.pose_enc import encoding_to_camera
 
@@ -49,7 +50,6 @@ class ReconDet(Base3DDetector):
             deformable_num_points=4,
             reconstruction_query_score_thr=0.1,
             query_clustering_cfg=None,
-            query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
             gt_points_dir=None,
             supervise_2d_bbox=True,
             reconstruction_depth_loss_weight=1.0,
@@ -145,9 +145,6 @@ class ReconDet(Base3DDetector):
         )
         self.if_mix_precision = if_mix_precision
         self.reconstruction_query_score_thr = reconstruction_query_score_thr
-        if len(query_xyz_range) != 6:
-            raise ValueError('query_xyz_range must contain 6 values')
-        self.query_xyz_range = tuple(float(value) for value in query_xyz_range)
         if gt_points_dir is None:
             raise ValueError('VGGT GT inverse alignment requires gt_points_dir')
         self.gt_points_dir = Path(gt_points_dir)
@@ -315,8 +312,10 @@ class ReconDet(Base3DDetector):
             reconstruction_query.to(projected_semantic.dtype) +
             projected_semantic)
 
-    def _cluster_reconstruction_queries(self, selected_scenes):
+    def _cluster_reconstruction_queries(self, selected_scenes,
+                                        return_diagnostics=False):
         clustered = []
+        diagnostics = []
         for scene in selected_scenes:
             selected_points = scene['points_aligned']
             selected_hidden = scene['reconstruction_query']
@@ -332,12 +331,20 @@ class ReconDet(Base3DDetector):
             clustered.append(
                 (cluster_xyz[0], cluster_size[0], cluster_query[0],
                  cluster_semantic_query[0]))
+            diagnostics.append({
+                'reconstruction_points': selected_points.detach(),
+                'reconstruction_scores': selected_scores.detach(),
+                'cluster_centers': cluster_xyz[0].detach(),
+                'cluster_sizes': cluster_size[0].detach(),
+            })
         (cluster_xyz, cluster_size, cluster_query,
          cluster_semantic_query) = [
             torch.stack(items).detach() for items in zip(*clustered)
         ]
         detection_query = self._fuse_detection_queries(
             cluster_query, cluster_semantic_query)
+        if return_diagnostics:
+            return (cluster_xyz, cluster_size, detection_query, diagnostics)
         return cluster_xyz, cluster_size, detection_query
 
     def get_box_features(self, feature_maps, batch_inputs_dict, images,
@@ -345,18 +352,12 @@ class ReconDet(Base3DDetector):
         query_xyz = query_xyz.to(device=images.device, dtype=images.dtype)
         query_size = query_size.to(device=images.device, dtype=images.dtype)
         query = query.to(device=images.device, dtype=feature_maps[0].dtype)
-        reference_points, reference_min, reference_max = normalize_query_points(
-            query_xyz, self.query_xyz_range)
         batch_inputs_dict['query_xyz'] = query_xyz
         batch_inputs_dict['query_size'] = query_size
-        batch_inputs_dict['reference_min'] = reference_min
-        batch_inputs_dict['reference_max'] = reference_max
         return self.decoder(
             query,
             feature_maps,
-            reference_points,
-            reference_min,
-            reference_max,
+            query_xyz,
             extrinsics,
             intrinsics,
             images.shape[-2:],
@@ -434,8 +435,9 @@ class ReconDet(Base3DDetector):
             reconstruction_outputs, batch_inputs_dict, img)
         selected_reconstruction = self._select_reconstruction_queries(
             reconstruction_outputs, img)
-        query_xyz, query_size, query = (
-            self._cluster_reconstruction_queries(selected_reconstruction))
+        (query_xyz, query_size, query, cluster_diagnostics) = (
+            self._cluster_reconstruction_queries(
+                selected_reconstruction, return_diagnostics=True))
         box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz, query_size, query,
             extrinsics, intrinsics)
@@ -455,14 +457,15 @@ class ReconDet(Base3DDetector):
         if self.prediction_visualization:
             self._save_prediction_visualizations(
                 batch_data_samples, results_list, reconstruction_outputs,
-                num_views=img.shape[1])
+                num_views=img.shape[1], cluster_diagnostics=cluster_diagnostics)
         predictions = self.add_pred_to_datasample(batch_data_samples,
                                                   results_list)
         return predictions
 
     @torch.no_grad()
     def _save_prediction_visualizations(self, batch_data_samples, results_list,
-                                        reconstruction_outputs, num_views):
+                                        reconstruction_outputs, num_views,
+                                        cluster_diagnostics=None):
         points = reconstruction_outputs['points_aligned']
         scores = reconstruction_outputs['class_scores_2d'].amax(dim=-1)
         batch_size = len(batch_data_samples)
@@ -487,6 +490,17 @@ class ReconDet(Base3DDetector):
                 scores[batch_index].reshape(-1),
                 self.semantic_encoder.classes,
                 score_threshold=self.prediction_visualization_score_thr)
+            if cluster_diagnostics is not None:
+                diagnostics = cluster_diagnostics[batch_index]
+                save_scene_cluster_visualization(
+                    self.prediction_visualization_dir,
+                    scene_id,
+                    gt_points,
+                    diagnostics['reconstruction_points'],
+                    diagnostics['reconstruction_scores'],
+                    diagnostics['cluster_centers'],
+                    diagnostics['cluster_sizes'],
+                    score_threshold=self.prediction_visualization_score_thr)
 
     def _forward(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                  *args, **kwargs) -> Tuple[List[torch.Tensor]]:

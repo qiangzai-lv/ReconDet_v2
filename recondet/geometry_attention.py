@@ -6,19 +6,14 @@ import torch.nn.functional as F
 from mmcv.ops import MultiScaleDeformableAttention
 
 
-def inverse_sigmoid(value, eps=1e-5):
-    value = value.clamp(min=0.0, max=1.0)
-    value = value.clamp(min=eps, max=1.0 - eps)
-    return torch.log(value / (1.0 - value))
-
-
-def denormalize_reference_points(reference_points, reference_min,
-                                 reference_max):
-    return reference_min[:, None] + reference_points * (
-        reference_max - reference_min)[:, None]
-
-
 def project_queries_to_views(query_xyz, extrinsics, intrinsics, image_shape):
+    """Project internal geometric-center queries into each camera view.
+
+    ``query_xyz`` is not a ``DepthInstance3DBoxes`` tensor. It is the
+    geometric center used by the decoder and by the symmetric center-size
+    box representation. Conversion to the bottom-center convention happens
+    only when the final ``DepthInstance3DBoxes`` object is constructed.
+    """
     rotation = extrinsics[..., :3, :3]
     translation = extrinsics[..., :3, 3]
     camera_points = torch.einsum(
@@ -164,8 +159,8 @@ class GeometryAwareDeformableDecoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(embed_dims)
 
-    def forward(self, query, feature_maps, reference_points, reference_min,
-                reference_max, extrinsics, intrinsics, image_shape,
+    def forward(self, query, feature_maps, reference_xyz, extrinsics,
+                intrinsics, image_shape,
                 position_embedding, query_projection, center_branches):
         if len(center_branches) != len(self.layers):
             raise ValueError(
@@ -174,8 +169,7 @@ class GeometryAwareDeformableDecoder(nn.Module):
         intermediate = []
         intermediate_references = []
         for layer_id, layer in enumerate(self.layers):
-            query_xyz = denormalize_reference_points(
-                reference_points, reference_min, reference_max)
+            query_xyz = reference_xyz
             query_pos = query_projection(
                 position_embedding(query_xyz, input_range=None)).transpose(1, 2)
             image_references, view_mask = project_queries_to_views(
@@ -186,13 +180,10 @@ class GeometryAwareDeformableDecoder(nn.Module):
 
             center_delta = center_branches[layer_id](
                 output.transpose(1, 2)).transpose(1, 2)
-            new_reference_points = (
-                inverse_sigmoid(reference_points) + center_delta).sigmoid()
-            refined_query_xyz = denormalize_reference_points(
-                new_reference_points, reference_min, reference_max)
+            new_reference_xyz = query_xyz + center_delta
 
             intermediate.append(output.transpose(1, 2))
-            intermediate_references.append(refined_query_xyz)
-            reference_points = new_reference_points.detach()
+            intermediate_references.append(new_reference_xyz)
+            reference_xyz = new_reference_xyz.detach()
 
         return intermediate, intermediate_references

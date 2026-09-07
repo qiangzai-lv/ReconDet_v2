@@ -10,7 +10,7 @@ from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
 from recondet.camera_alignment import (
     denormalize_vggt_gt_cameras, denormalize_vggt_gt_points,
-    load_axis_aligned_points)
+    load_axis_aligned_points, normalize_query_points)
 from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.device import autocast, get_device
@@ -50,6 +50,7 @@ class ReconDet(Base3DDetector):
             deformable_num_points=4,
             reconstruction_query_score_thr=0.1,
             query_clustering_cfg=None,
+            query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
             gt_points_dir=None,
             supervise_2d_bbox=True,
             reconstruction_depth_loss_weight=1.0,
@@ -145,6 +146,9 @@ class ReconDet(Base3DDetector):
         )
         self.if_mix_precision = if_mix_precision
         self.reconstruction_query_score_thr = reconstruction_query_score_thr
+        if len(query_xyz_range) != 6:
+            raise ValueError('query_xyz_range must contain 6 values')
+        self.query_xyz_range = tuple(float(value) for value in query_xyz_range)
         if gt_points_dir is None:
             raise ValueError('VGGT GT inverse alignment requires gt_points_dir')
         self.gt_points_dir = Path(gt_points_dir)
@@ -352,12 +356,18 @@ class ReconDet(Base3DDetector):
         query_xyz = query_xyz.to(device=images.device, dtype=images.dtype)
         query_size = query_size.to(device=images.device, dtype=images.dtype)
         query = query.to(device=images.device, dtype=feature_maps[0].dtype)
+        reference_points, reference_min, reference_max = normalize_query_points(
+            query_xyz, self.query_xyz_range)
         batch_inputs_dict['query_xyz'] = query_xyz
         batch_inputs_dict['query_size'] = query_size
+        batch_inputs_dict['reference_min'] = reference_min
+        batch_inputs_dict['reference_max'] = reference_max
         return self.decoder(
             query,
             feature_maps,
-            query_xyz,
+            reference_points,
+            reference_min,
+            reference_max,
             extrinsics,
             intrinsics,
             images.shape[-2:],

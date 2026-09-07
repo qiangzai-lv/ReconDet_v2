@@ -303,3 +303,18 @@ def load_axis_aligned_points(path, num_point_features, axis_align_matrix):
     return (points @ axis_align_matrix[:3, :3].T +
             axis_align_matrix[:3, 3])
 
+
+def normalize_query_points(query_xyz, query_xyz_range, eps=1e-5):
+    query_range = query_xyz.new_tensor(query_xyz_range, dtype=torch.float32)
+    if query_range.numel() != 6:
+        raise ValueError('query_xyz_range must contain 6 values')
+    query_range = query_range.reshape(2, 3)
+    if not torch.isfinite(query_range).all():
+        raise ValueError('query_xyz_range must be finite')
+    if (query_range[1] <= query_range[0]).any():
+        raise ValueError('query_xyz_range maximums must exceed minimums')
+    reference_min = query_range[0].unsqueeze(0).expand(query_xyz.shape[0], -1)
+    reference_max = query_range[1].unsqueeze(0).expand(query_xyz.shape[0], -1)
+    references = ((query_xyz.float() - reference_min[:, None]) /
+                  (reference_max - reference_min)[:, None])
+    return references.clamp(eps, 1.0 - eps), reference_min, reference_max

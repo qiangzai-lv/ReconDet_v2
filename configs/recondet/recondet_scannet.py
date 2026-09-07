@@ -41,6 +41,7 @@ model = dict(
         class_cost_weight=0.5,
         query_cost_weight=0.25,
         min_cluster_size=0.05),
+    query_xyz_range=[-6.5, -9.0, -1.0, 6.5, 9.0, 4.5],
     gt_points_dir=gt_points_dir,
     supervise_2d_bbox=False,
     reconstruction_depth_loss_weight=5.0,

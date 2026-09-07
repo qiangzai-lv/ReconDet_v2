@@ -18,40 +18,7 @@ def denormalize_reference_points(reference_points, reference_min,
         reference_max - reference_min)[:, None]
 
 
-def normalize_query_sizes(query_sizes, reference_min, reference_max,
-                          eps=1e-5):
-    scene_extent = reference_max - reference_min
-    normalized = query_sizes.float() / scene_extent[:, None]
-    return normalized.clamp(eps, 1.0 - eps)
-
-
-def refine_size_reference(reference_sizes, size_delta, reference_min,
-                          reference_max):
-    new_reference_sizes = (
-        inverse_sigmoid(reference_sizes) + size_delta.float()).sigmoid()
-    metric_sizes = new_reference_sizes * (
-        reference_max - reference_min)[:, None]
-    return new_reference_sizes, metric_sizes
-
-
 def project_queries_to_views(query_xyz, extrinsics, intrinsics, image_shape):
-    if query_xyz.ndim != 3 or query_xyz.shape[-1] != 3:
-        raise ValueError('query_xyz must have shape [B, Q, 3]')
-    if extrinsics.ndim != 4 or extrinsics.shape[-2:] != (3, 4):
-        raise ValueError('extrinsics must have shape [B, V, 3, 4]')
-    if intrinsics.ndim != 4 or intrinsics.shape[-2:] != (3, 3):
-        raise ValueError('intrinsics must have shape [B, V, 3, 3]')
-    if extrinsics.shape[:2] != intrinsics.shape[:2]:
-        raise ValueError('extrinsics and intrinsics must share B and V')
-    if query_xyz.shape[0] != extrinsics.shape[0]:
-        raise ValueError('queries and cameras must share the batch dimension')
-    if len(image_shape) != 2 or min(image_shape) <= 0:
-        raise ValueError('image_shape must contain positive height and width')
-    if not torch.isfinite(extrinsics).all():
-        raise FloatingPointError('extrinsics contain non-finite values')
-    if not torch.isfinite(intrinsics).all():
-        raise FloatingPointError('intrinsics contain non-finite values')
-
     rotation = extrinsics[..., :3, :3]
     translation = extrinsics[..., :3, 3]
     camera_points = torch.einsum(
@@ -197,30 +164,15 @@ class GeometryAwareDeformableDecoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(embed_dims)
 
-    def forward(self, query, feature_maps, reference_points,
-                size_reference_points, reference_min, reference_max,
-                extrinsics, intrinsics, image_shape, position_embedding,
-                query_projection, center_branches, size_branches):
-        if (len(center_branches) != len(self.layers) or
-                len(size_branches) != len(self.layers)):
+    def forward(self, query, feature_maps, reference_points, reference_min,
+                reference_max, extrinsics, intrinsics, image_shape,
+                position_embedding, query_projection, center_branches):
+        if len(center_branches) != len(self.layers):
             raise ValueError(
-                'Each decoder layer requires center and size branches')
-        if reference_points.shape != query.shape[:2] + (3,):
-            raise ValueError(
-                'reference_points must have shape [B, Q, 3] matching query')
-        if size_reference_points.shape != query.shape[:2] + (3,):
-            raise ValueError(
-                'size_reference_points must have shape [B, Q, 3] matching query')
-        if reference_min.shape != (query.shape[0], 3):
-            raise ValueError('reference_min must have shape [B, 3]')
-        if reference_max.shape != (query.shape[0], 3):
-            raise ValueError('reference_max must have shape [B, 3]')
-        if (reference_max <= reference_min).any():
-            raise ValueError('reference_max must exceed reference_min')
+                'Each decoder layer requires one center regression branch')
 
         intermediate = []
         intermediate_references = []
-        intermediate_sizes = []
         for layer_id, layer in enumerate(self.layers):
             query_xyz = denormalize_reference_points(
                 reference_points, reference_min, reference_max)
@@ -234,21 +186,13 @@ class GeometryAwareDeformableDecoder(nn.Module):
 
             center_delta = center_branches[layer_id](
                 output.transpose(1, 2)).transpose(1, 2)
-            size_delta = size_branches[layer_id](
-                output.transpose(1, 2)).transpose(1, 2)
             new_reference_points = (
                 inverse_sigmoid(reference_points) + center_delta).sigmoid()
             refined_query_xyz = denormalize_reference_points(
                 new_reference_points, reference_min, reference_max)
-            new_size_reference_points, refined_query_size = (
-                refine_size_reference(
-                    size_reference_points, size_delta,
-                    reference_min, reference_max))
 
             intermediate.append(output.transpose(1, 2))
             intermediate_references.append(refined_query_xyz)
-            intermediate_sizes.append(refined_query_size)
             reference_points = new_reference_points.detach()
-            size_reference_points = new_size_reference_points.detach()
 
-        return intermediate, intermediate_references, intermediate_sizes
+        return intermediate, intermediate_references

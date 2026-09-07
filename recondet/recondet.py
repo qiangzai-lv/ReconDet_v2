@@ -16,7 +16,6 @@ from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.device import autocast, get_device
 from recondet.feature_projection import VGGTFeatureProjector
 from recondet.geometry_attention import GeometryAwareDeformableDecoder
-from recondet.geometry_attention import normalize_query_sizes
 from recondet.grounding_dino_encoder import GroundingDINOSemanticEncoder
 from recondet.query_correspondence import (
     select_scene_reconstruction_queries, SemanticWeightedFPSClustering)
@@ -340,8 +339,6 @@ class ReconDet(Base3DDetector):
         query = query.to(device=images.device, dtype=feature_maps[0].dtype)
         reference_points, reference_min, reference_max = normalize_query_points(
             query_xyz, self.query_xyz_range)
-        size_reference_points = normalize_query_sizes(
-            query_size, reference_min, reference_max)
         batch_inputs_dict['query_xyz'] = query_xyz
         batch_inputs_dict['query_size'] = query_size
         batch_inputs_dict['reference_min'] = reference_min
@@ -350,7 +347,6 @@ class ReconDet(Base3DDetector):
             query,
             feature_maps,
             reference_points,
-            size_reference_points,
             reference_min,
             reference_max,
             extrinsics,
@@ -358,8 +354,7 @@ class ReconDet(Base3DDetector):
             images.shape[-2:],
             self.pos_embedding,
             self.query_projection,
-            self.bbox_head.center_heads,
-            self.bbox_head.size_heads)
+            self.bbox_head.center_heads)
 
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
@@ -399,7 +394,7 @@ class ReconDet(Base3DDetector):
             reconstruction_outputs, img)
         query_xyz, query_size, query = (
             self._cluster_reconstruction_queries(selected_reconstruction))
-        box_features, refined_query_xyz, refined_query_sizes = self.get_box_features(
+        box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz, query_size, query,
             extrinsics, intrinsics)
         detection_losses = self.bbox_head.loss(
@@ -407,7 +402,6 @@ class ReconDet(Base3DDetector):
             batch_data_samples,
             batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
-            refined_query_sizes=refined_query_sizes,
             **kwargs)
         losses.update({f'recondet_{name}': value
                        for name, value in detection_losses.items()})
@@ -434,14 +428,13 @@ class ReconDet(Base3DDetector):
             reconstruction_outputs, img)
         query_xyz, query_size, query = (
             self._cluster_reconstruction_queries(selected_reconstruction))
-        box_features, refined_query_xyz, refined_query_sizes = self.get_box_features(
+        box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz, query_size, query,
             extrinsics, intrinsics)
         layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:
             box_features = [box_features[-1]]
             refined_query_xyz = [refined_query_xyz[-1]]
-            refined_query_sizes = [refined_query_sizes[-1]]
             layer_ids = [layer_ids[-1]]
 
         results_list = self.bbox_head.predict(
@@ -449,7 +442,6 @@ class ReconDet(Base3DDetector):
             batch_data_samples,
             batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
-            refined_query_sizes=refined_query_sizes,
             layer_ids=layer_ids,
             **kwargs)
         predictions = self.add_pred_to_datasample(batch_data_samples,
@@ -476,7 +468,7 @@ class ReconDet(Base3DDetector):
             reconstruction_outputs, img)
         query_xyz, query_size, query = (
             self._cluster_reconstruction_queries(selected_reconstruction))
-        box_features, refined_query_xyz, refined_query_sizes = self.get_box_features(
+        box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz, query_size, query,
             extrinsics, intrinsics)
 
@@ -484,10 +476,8 @@ class ReconDet(Base3DDetector):
         if self.test_only_last_layer:
             box_features = [box_features[-1]]
             refined_query_xyz = [refined_query_xyz[-1]]
-            refined_query_sizes = [refined_query_sizes[-1]]
             layer_ids = [layer_ids[-1]]
 
         results = self.bbox_head.forward(
-            box_features, batch_inputs_dict, refined_query_xyz,
-            refined_query_sizes, layer_ids)
+            box_features, batch_inputs_dict, refined_query_xyz, layer_ids)
         return results

@@ -19,19 +19,6 @@ from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
 from recondet.matcher import UnifiedMatcher, UnifiedMatcherMoreThanOne
 
 
-@torch.no_grad()
-def get_points(n_voxels, voxel_size, origin):
-    # origin: point-cloud center.
-    points = torch.stack(
-        torch.meshgrid([
-            torch.arange(n_voxels[0]),  # 40 W width, x
-            torch.arange(n_voxels[1]),  # 40 D depth, y
-            torch.arange(n_voxels[2])  # 16 H Height, z
-        ]))
-    new_origin = origin - n_voxels / 2. * voxel_size
-    points = points * voxel_size.view(3, 1, 1, 1) + new_origin.view(3, 1, 1, 1)
-    return points
-
 
 @MODELS.register_module()
 class ReconDetHead(BaseModule):

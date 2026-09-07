@@ -22,6 +22,7 @@ from recondet.query_correspondence import (
 from recondet.vggt_camera_loss import (
     compute_vggt_camera_loss, VGGT_CAMERA_LOSS_DEFAULTS)
 from recondet.vggt_ground_truth import mean_point_distance, transform_points
+from recondet.prediction_visualization import save_scene_prediction_visualization
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.pose_enc import encoding_to_camera
 
@@ -57,6 +58,9 @@ class ReconDet(Base3DDetector):
             camera_loss_cfg=None,
             supervise_confident_query_depth=False,
             confident_query_depth_cfg=None,
+            prediction_visualization=False,
+            prediction_visualization_dir='work_dirs/recondet_visualizations',
+            prediction_visualization_score_thr=0.1,
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -147,6 +151,10 @@ class ReconDet(Base3DDetector):
         if gt_points_dir is None:
             raise ValueError('VGGT GT inverse alignment requires gt_points_dir')
         self.gt_points_dir = Path(gt_points_dir)
+        self.prediction_visualization = bool(prediction_visualization)
+        self.prediction_visualization_dir = Path(prediction_visualization_dir)
+        self.prediction_visualization_score_thr = float(
+            prediction_visualization_score_thr)
         self._vggt_gt_scale_cache = {}
 
     def _configure_vggt_trainability(self, training):
@@ -444,9 +452,41 @@ class ReconDet(Base3DDetector):
             refined_query_xyz=refined_query_xyz,
             layer_ids=layer_ids,
             **kwargs)
+        if self.prediction_visualization:
+            self._save_prediction_visualizations(
+                batch_data_samples, results_list, reconstruction_outputs,
+                num_views=img.shape[1])
         predictions = self.add_pred_to_datasample(batch_data_samples,
                                                   results_list)
         return predictions
+
+    @torch.no_grad()
+    def _save_prediction_visualizations(self, batch_data_samples, results_list,
+                                        reconstruction_outputs, num_views):
+        points = reconstruction_outputs['points_aligned']
+        scores = reconstruction_outputs['class_scores_2d'].amax(dim=-1)
+        batch_size = len(batch_data_samples)
+        points = points.reshape(batch_size, num_views, *points.shape[1:])
+        scores = scores.reshape(batch_size, num_views, *scores.shape[1:])
+        for batch_index, (sample, result) in enumerate(
+                zip(batch_data_samples, results_list)):
+            metadata = sample.metainfo
+            _, gt_points = self._load_axis_aligned_gt_points(metadata)
+            gt = sample.gt_instances_3d
+            scene_id = metadata.get('scene_id', f'scene_{batch_index}')
+            save_scene_prediction_visualization(
+                self.prediction_visualization_dir,
+                scene_id,
+                gt_points,
+                gt.bboxes_3d,
+                gt.labels_3d,
+                result.bboxes_3d,
+                result.scores_3d,
+                result.labels_3d,
+                points[batch_index].reshape(-1, 3),
+                scores[batch_index].reshape(-1),
+                self.semantic_encoder.classes,
+                score_threshold=self.prediction_visualization_score_thr)
 
     def _forward(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                  *args, **kwargs) -> Tuple[List[torch.Tensor]]:

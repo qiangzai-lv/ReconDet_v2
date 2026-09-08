@@ -33,7 +33,8 @@ def select_scene_reconstruction_queries(
 
     required = (
         'reconstruction_query', 'detection_query_2d', 'points_vggt',
-        'points_aligned', 'class_scores_2d', 'valid_mask')
+        'points_aligned', 'reference_points_2d', 'bbox_preds',
+        'class_scores_2d', 'valid_mask')
     missing = [key for key in required if key not in reconstruction_outputs]
     if missing:
         raise KeyError(f'Missing reconstruction outputs: {missing}')
@@ -199,6 +200,7 @@ class SemanticWeightedFPSClustering:
         outputs_sizes = []
         outputs_queries = []
         outputs_semantic_queries = []
+        outputs_class_scores = []
         for batch_id in range(batch_size):
             sample_points = points[batch_id].float()
             sample_queries = queries[batch_id].float()
@@ -249,6 +251,9 @@ class SemanticWeightedFPSClustering:
             aggregated_semantic_queries = self._aggregate(
                 sample_semantic_queries, assignment, sample_weights,
                 len(centers), seed_semantic_queries)
+            aggregated_class_scores = self._aggregate(
+                class_scores[batch_id], assignment, sample_weights,
+                len(centers), class_scores[batch_id][init_ids])
             center_queries = F.layer_norm(
                 seed_queries + aggregated_queries,
                 (sample_queries.shape[-1],))
@@ -269,6 +274,10 @@ class SemanticWeightedFPSClustering:
                     aggregated_semantic_queries,
                     sample_semantic_queries[pad_ids]
                 ], dim=0)
+                aggregated_class_scores = torch.cat([
+                    aggregated_class_scores,
+                    class_scores[batch_id][pad_ids]
+                ], dim=0)
             outputs_points.append(
                 centers[:self.num_clusters].to(dtype=points.dtype))
             outputs_sizes.append(
@@ -278,7 +287,11 @@ class SemanticWeightedFPSClustering:
             outputs_semantic_queries.append(
                 aggregated_semantic_queries[:self.num_clusters].to(
                     dtype=queries_2d.dtype))
+            outputs_class_scores.append(
+                aggregated_class_scores[:self.num_clusters].to(
+                    dtype=class_scores.dtype))
 
         return (torch.stack(outputs_points), torch.stack(outputs_sizes),
                 torch.stack(outputs_queries),
-                torch.stack(outputs_semantic_queries))
+                torch.stack(outputs_semantic_queries),
+                torch.stack(outputs_class_scores))

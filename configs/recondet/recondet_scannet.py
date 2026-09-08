@@ -36,7 +36,15 @@ model = dict(
         dec_dropout=0.1,
         dec_nlayers=_decoder_layer_num
     ),
-    deformable_num_points=4,
+    geometry_attention_cfg=dict(
+        attention_blocks=[
+            ['proj', 'bbox'],
+            ['proj', 'bbox'],
+            ['proj', 'bbox'],
+            ['proj', 'bbox'],
+        ],
+        proj=dict(num_points=4),
+        bbox=dict(num_points=4)),
     query_clustering_cfg=dict(
         num_neighbors=4,
         class_cost_weight=0.5,
@@ -98,7 +106,7 @@ model = dict(
         if_v2_head=True,
         matcher='repeated_hungarian',
         initial_size_anchor=(1.0, 1.0, 1.0),
-        gt_repeat_num=5,
+        gt_repeat_num=1,
         center_range=_query_xyz_range_,
         size_logit_range=(-5.0, 5.0),
         loss_layer_ids=list(range(_decoder_layer_num))

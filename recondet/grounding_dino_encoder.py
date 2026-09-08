@@ -142,6 +142,11 @@ class GroundingDINOSemanticEncoder(nn.Module):
             token_scores, positive_maps)
         reconstruction_outputs['class_scores_2d'] = class_scores
         reconstruction_outputs['foreground_score'] = class_scores.amax(dim=-1)
+        bbox_preds = self.model.bbox_head._last_bbox_preds
+        if bbox_preds is None or bbox_preds.ndim != 4:
+            raise RuntimeError('Grounding-DINO bbox predictions are unavailable')
+        reconstruction_outputs['bbox_preds'] = bbox_preds[
+            -1, :, -query_count:].detach()
         return reconstruction_outputs
 
     @staticmethod

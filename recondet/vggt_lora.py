@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 import torch
+from mmengine.dist import is_main_process
+from mmengine.logging import print_log
 from torch import nn
 from torch.nn import functional as F
 
@@ -209,6 +211,39 @@ def configure_vggt_lora(
     trainable = sum(parameter.numel() for parameter in aggregator.parameters()
                     if parameter.requires_grad)
     return LoRAInjectionSummary(tuple(replaced), trainable)
+
+
+def format_vggt_lora_summary(
+        summary: LoRAInjectionSummary,
+        config: Mapping | None) -> str:
+    """Format the effective LoRA setup for the training log."""
+    values = _read_config(config)
+    if not values['enabled']:
+        return '[VGGT LoRA] enabled=False; no adapters injected'
+
+    lines = [
+        '[VGGT LoRA] enabled=True',
+        f"  blocks={list(values['block_indices'])}",
+        f"  branches={list(values['branches'])}",
+        f"  targets={list(values['target_modules'])}",
+        (f"  rank={values['rank']}, alpha={values['alpha']}, "
+         f"dropout={values['dropout']}"),
+        (f'  injected_modules={len(summary.replaced_modules)}, '
+         f'trainable_parameters={summary.trainable_parameters:,}'),
+        (f"  gradient_checkpointing={values['gradient_checkpointing']}, "
+         f"checkpoint_start_block={values['checkpoint_start_block']}"),
+        '  injected module names:',
+    ]
+    lines.extend(f'  - {name}' for name in summary.replaced_modules)
+    return '\n'.join(lines)
+
+
+def log_vggt_lora_summary(
+        summary: LoRAInjectionSummary,
+        config: Mapping | None) -> None:
+    """Log LoRA configuration once instead of once per distributed rank."""
+    if is_main_process():
+        print_log(format_vggt_lora_summary(summary, config), logger='current')
 
 
 def lora_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:

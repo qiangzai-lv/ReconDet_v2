@@ -24,7 +24,7 @@ from recondet.vggt_camera_loss import (
 from recondet.vggt_ground_truth import mean_point_distance, transform_points
 from recondet.vggt_lora import (
     configure_vggt_lora, enable_lora_parameters,
-    vggt_feature_grad_context)
+    log_vggt_lora_summary, vggt_feature_grad_context)
 from recondet.prediction_visualization import (
     save_scene_cluster_visualization, save_scene_prediction_visualization)
 from vggt_omega.models import VGGTOmega
@@ -94,6 +94,7 @@ class ReconDet(Base3DDetector):
             self.camera_loss_cfg.update(camera_loss_cfg)
         self.vggt_lora_summary = configure_vggt_lora(
             self.vggt_encoder.aggregator, vggt_lora_cfg)
+        log_vggt_lora_summary(self.vggt_lora_summary, vggt_lora_cfg)
         self.vggt_lora_enabled = bool(
             self.vggt_lora_summary.replaced_modules)
         self._configure_vggt_trainability(training=self.training)

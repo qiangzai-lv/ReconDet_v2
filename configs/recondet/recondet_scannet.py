@@ -20,6 +20,16 @@ _query_xyz_range_ = [-6.5, -9.0, -1.0, 6.5, 9.0, 4.5]
 model = dict(
     type='ReconDet',
     vggt_omega_checkpoint=vggt_omega_checkpoint,
+    vggt_lora_cfg=dict(
+        enabled=True,
+        block_indices=[3, 4, 10, 11, 16, 17, 22, 23],
+        branches=['frame_blocks', 'inter_frame_blocks'],
+        target_modules=['attn.qkv', 'attn.proj'],
+        rank=8,
+        alpha=16,
+        dropout=0.0,
+        gradient_checkpointing=True,
+        checkpoint_start_block=3),
     g_dino_cfg=dict(
         grounding_dino_config=grounding_dino_config,
         grounding_dino_checkpoint=grounding_dino_checkpoint,
@@ -151,7 +161,7 @@ train_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
-        n_images=42,
+        n_images=40,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),

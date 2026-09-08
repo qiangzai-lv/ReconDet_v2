@@ -22,6 +22,9 @@ from recondet.query_correspondence import (
 from recondet.vggt_camera_loss import (
     compute_vggt_camera_loss, VGGT_CAMERA_LOSS_DEFAULTS)
 from recondet.vggt_ground_truth import mean_point_distance, transform_points
+from recondet.vggt_lora import (
+    configure_vggt_lora, enable_lora_parameters,
+    vggt_feature_grad_context)
 from recondet.prediction_visualization import (
     save_scene_cluster_visualization, save_scene_prediction_visualization)
 from vggt_omega.models import VGGTOmega
@@ -47,6 +50,7 @@ class ReconDet(Base3DDetector):
             position_embedding="fourier",
             if_mix_precision=False,
             vggt_omega_checkpoint=None,
+            vggt_lora_cfg=None,
             deformable_num_points=4,
             reconstruction_query_score_thr=0.1,
             query_clustering_cfg=None,
@@ -88,6 +92,10 @@ class ReconDet(Base3DDetector):
                     'Unknown camera_loss_cfg keys: '
                     f'{sorted(unknown_keys)}')
             self.camera_loss_cfg.update(camera_loss_cfg)
+        self.vggt_lora_summary = configure_vggt_lora(
+            self.vggt_encoder.aggregator, vggt_lora_cfg)
+        self.vggt_lora_enabled = bool(
+            self.vggt_lora_summary.replaced_modules)
         self._configure_vggt_trainability(training=self.training)
 
         # gdino encoder
@@ -161,6 +169,9 @@ class ReconDet(Base3DDetector):
     def _configure_vggt_trainability(self, training):
         self.vggt_encoder.requires_grad_(False)
         self.vggt_encoder.eval()
+        if self.vggt_lora_enabled:
+            enable_lora_parameters(self.vggt_encoder.aggregator)
+            self.vggt_encoder.aggregator.train(bool(training))
         camera_head = self.vggt_encoder.camera_head
         camera_head.requires_grad_(self.supervise_camera_head)
         camera_head.train(bool(training and self.supervise_camera_head))
@@ -170,10 +181,10 @@ class ReconDet(Base3DDetector):
         self._configure_vggt_trainability(training=mode)
         return self
 
-    @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
                      batch_data_samples: SampleList, mode):
-        with torch.no_grad():
+        keep_graph = self.training and self.vggt_lora_enabled
+        with vggt_feature_grad_context(keep_graph):
             # The data preprocessor converts raw BGR uint8 images to RGB without
             # normalization. VGGT-Omega expects RGB values in [0, 1].
             img = batch_inputs_dict['imgs'].float().div(255.0)

@@ -1,4 +1,13 @@
 _base_ = ['../_base_/default_runtime.py']
+
+import torch
+try:
+    import torch_npu  # noqa: F401
+    _dist_backend_ = 'hccl' if torch.npu.is_available() else 'nccl'
+except ImportError:
+    _dist_backend_ = 'nccl'
+env_cfg = dict(dist_cfg=dict(backend=_dist_backend_))
+
 custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
 
 data_root = '/root/shared-nvme/data/ScanNet_processed_v2'

@@ -2,7 +2,7 @@ _base_ = ['../_base_/default_runtime.py']
 custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
 
 data_root = '/root/shared-nvme/data/ScanNet_processed_v2'
-scannet_2d_ann_root = '/root/shared-nvme/data/scannet_coco_v2'
+scannet_ann_root = '/root/shared-nvme/data/scannet_coco_v2/'
 gt_points_dir = f'{data_root}/points'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
 
@@ -54,7 +54,8 @@ model = dict(
         min_cluster_size=0.05),
     query_xyz_range=_query_xyz_range_,
     gt_points_dir=gt_points_dir,
-    supervise_2d_bbox=False,
+    supervise_2d_bbox=True,
+    train_2d_only=True,
     reconstruction_depth_loss_weight=5.0,
     reconstruction_point_loss_weight=2.0,
     supervise_camera_head=True,
@@ -200,18 +201,35 @@ train_dataloader = dict(
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
         type='RepeatDataset',
-        times=6,
+        times=1,
         dataset=dict(
             type=dataset_type,
             data_root=data_root,
             ann_file='scannet_infos_train_mvod.pkl',
-            ann_file_2d=f'{scannet_2d_ann_root}/keypoints_bbox_train.json',
+            ann_file_2d=scannet_ann_root + 'keypoints_bbox_train.json',
             pipeline=train_pipeline,
             modality=train_input_modality,
             test_mode=False,
             filter_empty_gt=True,
             box_type_3d='Depth',
             metainfo=dict(CLASSES=class_names))))
+
+backend_args = None
+
+test_pipeline_2d = [
+    dict(type='mmdet.LoadImageFromFile', backend_args=backend_args),
+    dict(
+        type='mmdet.Resize',
+        scale=(448, 448),
+        keep_ratio=True,
+        interpolation='bicubic'),
+    dict(type='mmdet.LoadAnnotations', with_bbox=True),
+    dict(
+        type='mmdet.PackDetInputs',
+        meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
+                   'scale_factor', 'text', 'custom_entities',
+                   'tokens_positive'))
+]
 
 val_dataloader = dict(
     batch_size=1,
@@ -220,24 +238,30 @@ val_dataloader = dict(
     drop_last=False,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
-        type=dataset_type,
+        type='mmdet.CocoDataset',
         data_root=data_root,
-        ann_file='scannet_infos_val_mvod.pkl',
-        pipeline=test_pipeline,
-        modality=test_input_modality,
+        ann_file=scannet_ann_root + 'keypoints_bbox_val.json',
+        data_prefix=dict(img=''),
+        metainfo=dict(classes=class_names),
+        return_classes=True,
         test_mode=True,
-        filter_empty_gt=True,
-        box_type_3d='Depth',
-        metainfo=dict(CLASSES=class_names)))
+        pipeline=test_pipeline_2d,
+        backend_args=backend_args))
 test_dataloader = val_dataloader
 
-val_evaluator = [dict(type='IndoorMetric')]
+val_evaluator = dict(
+    type='mmdet.CocoMetric',
+    ann_file=scannet_ann_root + 'keypoints_bbox_val.json',
+    metric='bbox',
+    classwise=True,
+    format_only=False,
+    backend_args=backend_args)
 test_evaluator = val_evaluator
 
 # train cfg
 _warm_epoch = 0
 _max_epoch = 200
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=2)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=1)
 test_cfg = dict()
 val_cfg = dict()
 
@@ -263,7 +287,7 @@ param_scheduler = [
 ]
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule="greater", interval=2, max_keep_ckpts=4),
+    checkpoint=dict(type='CheckpointHook', save_best=['coco/bbox_mAP'], rule="greater", interval=2, max_keep_ckpts=4),
     logger=dict(type='LoggerHook', interval=10)
 )
 

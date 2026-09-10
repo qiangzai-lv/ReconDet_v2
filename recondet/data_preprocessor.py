@@ -81,8 +81,18 @@ class ReconDetDataPreprocessor(DetDataPreprocessor):
                 aug_batch_data.append(single_aug_batch_data)
             return aug_batch_data
 
-        else:
-            return self.simple_process(data, training)
+        if not isinstance(data.get('inputs'), dict):
+            data = super().forward(data, training=training)
+            images = data['inputs']
+            if images.ndim != 4:
+                raise ValueError(
+                    'Standard 2D inputs must have shape [B, C, H, W]')
+            return {
+                'inputs': {'imgs': images.unsqueeze(1)},
+                'data_samples': data['data_samples'],
+            }
+
+        return self.simple_process(data, training)
 
     def simple_process(self, data: dict, training: bool = False) -> dict:
 
@@ -241,6 +251,9 @@ class ReconDetDataPreprocessor(DetDataPreprocessor):
         return data
 
     def _get_pad_shape(self, data: dict) -> List[Tuple[int, int]]:
+
+        if not isinstance(data.get('inputs'), dict):
+            return super()._get_pad_shape(data)
 
         _batch_inputs = data['inputs']['img']
         if is_seq_of(_batch_inputs, torch.Tensor):

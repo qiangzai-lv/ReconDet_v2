@@ -57,6 +57,7 @@ class ReconDet(Base3DDetector):
             query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
             gt_points_dir=None,
             supervise_2d_bbox=True,
+            train_2d_only=False,
             reconstruction_depth_loss_weight=1.0,
             reconstruction_point_loss_weight=0.5,
             supervise_camera_head=False,
@@ -112,6 +113,7 @@ class ReconDet(Base3DDetector):
             supervise_confident_query_depth=(
                 supervise_confident_query_depth),
             confident_query_depth_cfg=confident_query_depth_cfg)
+        self.train_2d_only = bool(train_2d_only)
         semantic_query_dims = self.semantic_encoder.model.embed_dims
         self.semantic_query_projection = torch.nn.Linear(
             semantic_query_dims, token_dim)
@@ -387,6 +389,14 @@ class ReconDet(Base3DDetector):
 
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
+        if self.train_2d_only:
+            semantic_losses = self.semantic_encoder.loss(
+                batch_inputs_dict['imgs'],
+                batch_data_samples,
+                return_reconstruction=False)
+            return {f'gdino_{name}': value
+                    for name, value in semantic_losses.items()}
+
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'train')
         vggt_feature_maps = self.feature_projector(
@@ -439,6 +449,10 @@ class ReconDet(Base3DDetector):
 
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                 **kwargs) -> SampleList:
+
+        if self.train_2d_only:
+            return self.semantic_encoder.predict_2d(
+                batch_inputs_dict['imgs'], batch_data_samples)
 
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'test')

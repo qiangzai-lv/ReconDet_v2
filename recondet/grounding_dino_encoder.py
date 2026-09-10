@@ -189,9 +189,12 @@ class GroundingDINOSemanticEncoder(nn.Module):
     def _make_training_samples(self, batch_data_samples, num_views,
                                padded_shape, gt_depths_vggt=None,
                                gt_depth_valid_masks=None,
-                               vggt_gt_scale=None):
-        supervise_confident_depth = getattr(
-            self, 'supervise_confident_query_depth', False)
+                               vggt_gt_scale=None,
+                               enable_confident_depth=None):
+        if enable_confident_depth is None:
+            enable_confident_depth = getattr(
+                self, 'supervise_confident_query_depth', False)
+        supervise_confident_depth = bool(enable_confident_depth)
         if supervise_confident_depth:
             if (gt_depths_vggt is None or gt_depth_valid_masks is None
                     or vggt_gt_scale is None):
@@ -265,7 +268,10 @@ class GroundingDINOSemanticEncoder(nn.Module):
             batch_data_samples, num_views, padded_shape,
             gt_depths_vggt=gt_depths_vggt,
             gt_depth_valid_masks=gt_depth_valid_masks,
-            vggt_gt_scale=vggt_gt_scale)
+            vggt_gt_scale=vggt_gt_scale,
+            enable_confident_depth=(
+                self.supervise_confident_query_depth
+                and return_reconstruction))
         flattened_vggt_features = None
         if vggt_feature_maps is not None:
             flattened_vggt_features = [
@@ -303,6 +309,16 @@ class GroundingDINOSemanticEncoder(nn.Module):
         ]
         self.last_valid_ratios = self.model._last_valid_ratios.reshape(
             batch_size, num_views, *self.model._last_valid_ratios.shape[1:])
+
+    @torch.no_grad()
+    def predict_2d(self, images, batch_data_samples):
+        if images.ndim != 5 or images.shape[1] != 1:
+            raise ValueError(
+                'Native 2D prediction requires images with shape '
+                '[B, 1, C, H, W]')
+        normalized = self._normalize_images(images, batch_data_samples)
+        return self.model.predict(
+            normalized, batch_data_samples, rescale=True)
 
     @torch.no_grad()
     def predict_and_print(self, images, batch_data_samples) -> None:

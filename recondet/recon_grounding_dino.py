@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from typing import Dict, Optional, Tuple, Union
 
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 from mmdet.models.detectors.grounding_dino import GroundingDINO
@@ -12,12 +13,14 @@ from mmdet.structures import OptSampleList, SampleList
 
 from recondet.grounding_dino_3d_decoder import (
     GroundingDINO3DDecoder, flatten_feature_maps, recover_feature_maps)
+from recondet.scene_query_exchange import SceneQueryExchange
 
 
 @MODELS.register_module()
 class ReconGroundingDINO(GroundingDINO):
 
-    def __init__(self, *args, reconstruction_decoder=None, **kwargs):
+    def __init__(self, *args, reconstruction_decoder=None,
+                 scene_query_exchange_cfg=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.reconstruction_decoder = None
         if reconstruction_decoder is not None:
@@ -29,6 +32,32 @@ class ReconGroundingDINO(GroundingDINO):
         self._active_image_shapes = None
         self._last_reconstruction_hidden_states = None
         self._last_reconstruction_outputs = None
+        self.scene_query_exchange = None
+        self.scene_query_exchange_single_view_dropout = 0.0
+        if scene_query_exchange_cfg is not None:
+            cfg = dict(scene_query_exchange_cfg)
+            enabled = bool(cfg.pop('enabled', True))
+            self.scene_query_exchange_single_view_dropout = float(
+                cfg.pop('single_view_dropout', 0.0))
+            if not 0 <= self.scene_query_exchange_single_view_dropout <= 1:
+                raise ValueError('single_view_dropout must be between 0 and 1')
+            if enabled:
+                self.scene_query_exchange = nn.ModuleList([
+                    SceneQueryExchange(embed_dims=self.embed_dims, **cfg)
+                    for _ in range(self.decoder.num_layers)
+                ])
+
+    def _exchange_detection_queries(self, query: Tensor, layer_id: int,
+                                    bypass: bool = False) -> Tensor:
+        """Apply one scene-local block to the trailing detection queries."""
+        if self.scene_query_exchange is None or bypass:
+            return query
+        if query.ndim != 3 or query.shape[1] < self.num_queries:
+            raise ValueError('decoder query must have shape [V, Q_total, D]')
+        detection_query = query[:, -self.num_queries:, :]
+        exchanged = self.scene_query_exchange[layer_id](
+            detection_query.unsqueeze(0)).squeeze(0)
+        return torch.cat([query[:, :-self.num_queries, :], exchanged], dim=1)
 
     @contextmanager
     def _using_vggt_features(self, feature_maps, extrinsics=None,
@@ -112,7 +141,10 @@ class ReconGroundingDINO(GroundingDINO):
                         vggt_intrinsics=None,
                         image_shapes=None,
                         **kwargs) -> Dict:
-        if self.reconstruction_decoder is None or vggt_feature_maps is None:
+        use_scene_exchange = self.scene_query_exchange is not None
+        use_reconstruction = not (
+            self.reconstruction_decoder is None or vggt_feature_maps is None)
+        if not use_scene_exchange and not use_reconstruction:
             return super().forward_decoder(
                 query=query,
                 memory=memory,
@@ -126,9 +158,15 @@ class ReconGroundingDINO(GroundingDINO):
                 text_attention_mask=text_attention_mask,
                 **kwargs)
 
-        spatial_features = flatten_feature_maps(vggt_feature_maps)
+        spatial_features = (
+            flatten_feature_maps(vggt_feature_maps)
+            if use_reconstruction else None)
         intermediate = []
         intermediate_reference_points = [reference_points]
+        bypass_scene_exchange = (
+            self.training
+            and torch.rand((), device=query.device)
+            < self.scene_query_exchange_single_view_dropout)
 
         for layer_id, layer in enumerate(self.decoder.layers):
             reference_points_input = reference_points[:, :, None] * torch.cat(
@@ -150,6 +188,8 @@ class ReconGroundingDINO(GroundingDINO):
                 memory_text=memory_text,
                 text_attention_mask=text_attention_mask,
                 **kwargs)
+            query = self._exchange_detection_queries(
+                query, layer_id, bypass=bool(bypass_scene_exchange))
 
             bbox_delta = self.bbox_head.reg_branches[layer_id](query)
             new_reference_points = (
@@ -173,6 +213,23 @@ class ReconGroundingDINO(GroundingDINO):
             inter_states[0] += (
                 self.dn_query_generator.label_embedding.weight[0, 0] * 0.0)
 
+        if not use_reconstruction:
+            # Store final decoder queries for embedding extraction
+            if not self.training and hasattr(self, '_capture_queries'):
+                # Extract final layer detection queries
+                # inter_states: [L, B*V, Q, 256] or [B*V, Q, 256]
+                if inter_states.ndim == 4:
+                    final_queries = inter_states[-1]  # [B*V, Q, 256]
+                else:
+                    final_queries = inter_states  # [B*V, Q, 256]
+
+                # Store queries - they will be reshaped in predict()
+                self._last_decoder_queries = final_queries
+
+            return {
+                'hidden_states': inter_states,
+                'references': list(references),
+            }
         if (vggt_extrinsics is None or vggt_intrinsics is None or
                 image_shapes is None):
             raise RuntimeError(

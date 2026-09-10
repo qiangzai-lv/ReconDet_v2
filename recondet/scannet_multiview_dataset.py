@@ -29,6 +29,7 @@ class ScanNet2DAnnotationIndex:
     images_by_view: Dict[Tuple[str, int], dict]
     annotations_by_image_id: Dict[int, list]
     category_id_to_name: Dict[int, str]
+    images_by_path: Dict[Tuple[str, str], dict]
 
 
 def load_scannet_2d_annotation_index(
@@ -100,7 +101,8 @@ def load_scannet_2d_annotation_index(
         by_image_key[(image['scene_id'], image['file_name'])].extend(records)
     return ScanNet2DAnnotationIndex(
         by_image_key, images_by_view, annotations_by_image_id,
-        category_id_to_name)
+        category_id_to_name,
+        {(r['scene_id'], r['file_name']): r for r in image_records.values()})
 
 
 def build_view_2d_instances(
@@ -262,6 +264,24 @@ class MultiViewScanNetDataset(Det3DDataset):
         info['axis_align_matrix'] = self._get_axis_align_matrix(info)
         if self._2d_annotation_index is not None:
             info['ann_info_2d'] = self._parse_2d_annotations(info)
+            image_ids_2d = []
+            for view_index in range(len(info['img_paths'])):
+                image = self._2d_annotation_index.images_by_path.get(
+                    (scene_id, _normalise_image_key(
+                        info['img_paths'][view_index],
+                        Path(self.data_root).resolve())))
+                if image is None:
+                    if self.test_mode:
+                        # Test mode: use placeholder image_id for missing views
+                        # These views will be skipped in metric computation
+                        image_ids_2d.append(-1)
+                    else:
+                        raise ValueError(
+                            '2D annotation image is missing for '
+                            f'{scene_id} view {view_index}')
+                else:
+                    image_ids_2d.append(int(image['image_id']))
+            info['image_ids_2d'] = image_ids_2d
         info['img_info'] = []
         info['lidar2img'] = []
         info['c2w'] = []

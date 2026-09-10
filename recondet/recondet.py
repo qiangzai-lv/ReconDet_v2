@@ -60,6 +60,9 @@ class ReconDet(Base3DDetector):
             train_2d_only=False,
             reconstruction_depth_loss_weight=1.0,
             reconstruction_point_loss_weight=0.5,
+            supervise_instance_consistency=False,
+            instance_consistency_cfg=None,
+            scene_query_exchange_cfg=None,
             supervise_camera_head=False,
             camera_loss_cfg=None,
             supervise_confident_query_depth=False,
@@ -110,6 +113,10 @@ class ReconDet(Base3DDetector):
                 reconstruction_depth_loss_weight),
             reconstruction_point_loss_weight=(
                 reconstruction_point_loss_weight),
+            supervise_instance_consistency=(
+                supervise_instance_consistency),
+            instance_consistency_cfg=instance_consistency_cfg,
+            scene_query_exchange_cfg=scene_query_exchange_cfg,
             supervise_confident_query_depth=(
                 supervise_confident_query_depth),
             confident_query_depth_cfg=confident_query_depth_cfg)
@@ -451,6 +458,9 @@ class ReconDet(Base3DDetector):
                 **kwargs) -> SampleList:
 
         if self.train_2d_only:
+            if batch_data_samples and 'view_img_ids' in batch_data_samples[0].metainfo:
+                return self.semantic_encoder.predict_scene_2d(
+                    batch_inputs_dict['imgs'], batch_data_samples)
             return self.semantic_encoder.predict_2d(
                 batch_inputs_dict['imgs'], batch_data_samples)
 

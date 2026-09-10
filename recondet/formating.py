@@ -99,7 +99,9 @@ class PackNeRFDetInputs(BaseTransform):
                             'cam2global', 'crop_offset', 'img_crop_offset',
                             'resize_img_shape', 'lidar2cam', 'ori_lidar2img',
                             'num_ref_frames', 'num_views', 'ego2global',
-                            'axis_align_matrix', 'view_indices', 'scene_id')
+                            'axis_align_matrix', 'view_indices', 'scene_id',
+                            'view_img_ids', 'view_ori_shapes',
+                            'view_img_shapes', 'view_scale_factors')
     ) -> None:
         self.keys = keys
         self.meta_keys = meta_keys
@@ -171,7 +173,14 @@ class PackNeRFDetInputs(BaseTransform):
         if 'img' in results:
             if isinstance(results['img'], list):
                 # process multiple imgs in single frame
-                imgs = np.stack(results['img'], axis=0) # (40, 239, 320, 3)
+                # Pad heterogeneous view sizes before stacking. Effective
+                # image sizes remain in view_img_shapes for attention masks.
+                height = max(img.shape[0] for img in results['img'])
+                width = max(img.shape[1] for img in results['img'])
+                imgs = np.stack([
+                    np.pad(img, ((0, height - img.shape[0]),
+                                 (0, width - img.shape[1]), (0, 0)))
+                    for img in results['img']], axis=0)
                 if imgs.flags.c_contiguous:
                     imgs = to_tensor(imgs).permute(0, 3, 1, 2).contiguous()
                 else:

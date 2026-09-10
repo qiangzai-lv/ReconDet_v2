@@ -93,6 +93,10 @@ class MultiViewPipeline(BaseTransform):
         extrinsics = []
         src_img_paths = []
         view_2d_instances = []
+        view_img_ids = []
+        view_ori_shapes = []
+        view_img_shapes = []
+        view_scale_factors = []
         all_2d_annotations = results.get('ann_info_2d')
         has_depth = 'depth_info' in results
         depths_metric = []
@@ -108,6 +112,8 @@ class MultiViewPipeline(BaseTransform):
 
             imgs.append(frame_results['img'])
             src_img_paths.append(img_path)
+            view_ori_shapes.append(tuple(frame_results['ori_shape'][:2]))
+            view_img_shapes.append(tuple(frame_results['img_shape'][:2]))
             scale_factor = frame_results.get('scale_factor')
             if scale_factor is None:
                 ori_height, ori_width = frame_results['ori_shape'][:2]
@@ -118,6 +124,8 @@ class MultiViewPipeline(BaseTransform):
                 view_2d_instances.append(build_view_2d_instances(
                     all_2d_annotations[view_index],
                     tuple(scale_factor[:2]), frame_results['img_shape']))
+                view_img_ids.append(int(results['image_ids_2d'][view_index]))
+            view_scale_factors.append(tuple(scale_factor[:4]))
             if has_depth:
                 depth_path = results['depth_info'][view_index]['filename']
                 depths_metric.append(load_and_resize_depth(
@@ -144,8 +152,12 @@ class MultiViewPipeline(BaseTransform):
         results['img'] = imgs
         results['img_path'] = src_img_paths
         results['view_indices'] = np.asarray(ids, dtype=np.int64)
+        results['view_ori_shapes'] = view_ori_shapes
+        results['view_img_shapes'] = view_img_shapes
+        results['view_scale_factors'] = view_scale_factors
         if all_2d_annotations is not None:
             results['gt_instances_2d'] = view_2d_instances
+            results['view_img_ids'] = view_img_ids
         if has_depth:
             results['gt_depths_metric'] = np.stack(
                 depths_metric).astype(np.float32)

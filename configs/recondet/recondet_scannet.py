@@ -56,6 +56,22 @@ model = dict(
     gt_points_dir=gt_points_dir,
     supervise_2d_bbox=True,
     train_2d_only=True,
+    supervise_instance_consistency=True,
+    instance_consistency_cfg=dict(
+        embedding_dims=128,
+        temperature=0.1,
+        loss_weight=0.1,
+        background_max_iou=0.3,
+        background_ratio=2.0,
+        min_background=8,
+        max_background=32),
+    scene_query_exchange_cfg=dict(
+        enabled=True,
+        num_heads=8,
+        ffn_dims=1024,
+        dropout=0.1,
+        residual_init=1e-3,
+        single_view_dropout=0.25),
     reconstruction_depth_loss_weight=5.0,
     reconstruction_point_loss_weight=2.0,
     supervise_camera_head=True,
@@ -183,7 +199,7 @@ test_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
-        n_images=128,
+        n_images=64,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
@@ -205,7 +221,7 @@ train_dataloader = dict(
         dataset=dict(
             type=dataset_type,
             data_root=data_root,
-            ann_file='scannet_infos_train_mvod.pkl',
+            ann_file='scannet_infos_train_mvod_with_ids.pkl',
             ann_file_2d=scannet_ann_root + 'keypoints_bbox_train.json',
             pipeline=train_pipeline,
             modality=train_input_modality,
@@ -238,19 +254,27 @@ val_dataloader = dict(
     drop_last=False,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
-        type='mmdet.CocoDataset',
+        type='MultiViewScanNetDataset',
         data_root=data_root,
-        ann_file=scannet_ann_root + 'keypoints_bbox_val.json',
-        data_prefix=dict(img=''),
+        ann_file='scannet_infos_val_mvod_with_ids.pkl',
+        ann_file_2d=scannet_ann_root + 'keypoints_bbox_val.json',
+        modality=test_input_modality,
+        load_eval_anns=False,
+        filter_empty_gt=False,
+        box_type_3d='Depth',
         metainfo=dict(classes=class_names),
-        return_classes=True,
         test_mode=True,
-        pipeline=test_pipeline_2d,
+        pipeline=[
+            dict(type='MultiViewPipeline', n_images=64, loading='uniform',
+                 transforms=[dict(type='LoadImageFromFile'),
+                             dict(type='Resize', scale=(448, 448),
+                                  keep_ratio=True, interpolation='bicubic')]),
+            dict(type='PackNeRFDetInputs', keys=['img'])],
         backend_args=backend_args))
 test_dataloader = val_dataloader
 
 val_evaluator = dict(
-    type='mmdet.CocoMetric',
+    type='SceneCocoMetric',
     ann_file=scannet_ann_root + 'keypoints_bbox_val.json',
     metric='bbox',
     classwise=True,
@@ -287,7 +311,7 @@ param_scheduler = [
 ]
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', save_best=['coco/bbox_mAP'], rule="greater", interval=2, max_keep_ckpts=4),
+    checkpoint=dict(type='CheckpointHook', save_best=['coco/bbox_mAP'], rule="greater", interval=1, max_keep_ckpts=4),
     logger=dict(type='LoggerHook', interval=10)
 )
 

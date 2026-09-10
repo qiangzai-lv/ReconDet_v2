@@ -13,6 +13,17 @@ from mmdet3d.registry import DATASETS
 from mmdet3d.structures import DepthInstance3DBoxes
 
 
+def resolve_3d_instance_ids(ann_info: dict) -> np.ndarray:
+    instance_ids = ann_info.get('instance_id')
+    if instance_ids is not None:
+        return np.asarray(instance_ids, dtype=np.int64).reshape(-1)
+    labels = np.asarray(
+        ann_info.get('gt_labels_3d', np.empty((0,), dtype=np.int64)))
+    if labels.size == 0:
+        return np.empty((0,), dtype=np.int64)
+    raise RuntimeError('ScanNet 3D annotations require instance_id metadata')
+
+
 def _normalise_image_key(value: Union[str, Path], data_root: Optional[Path] = None) -> str:
     path = Path(str(value))
     if path.is_absolute() and data_root is not None:
@@ -327,6 +338,9 @@ class MultiViewScanNetDataset(Det3DDataset):
         if self.test_mode and self.load_eval_anns:
             info['ann_info'] = self.parse_ann_info(info)
             info['eval_ann_info'] = self._remove_dontcare(info['ann_info'])
+        if info.get('ann_info') is not None:
+            info['gt_instance_ids_3d'] = resolve_3d_instance_ids(
+                info['ann_info'])
 
         return info
 

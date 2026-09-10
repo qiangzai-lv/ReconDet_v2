@@ -19,6 +19,8 @@ from recondet.geometry_attention import GeometryAwareDeformableDecoder
 from recondet.grounding_dino_encoder import GroundingDINOSemanticEncoder
 from recondet.query_correspondence import (
     select_scene_reconstruction_queries, SemanticWeightedFPSClustering)
+from recondet.reconstruction_object_head import (
+    ReconstructionObjectHead, collect_matched_object_samples)
 from recondet.vggt_camera_loss import (
     compute_vggt_camera_loss, VGGT_CAMERA_LOSS_DEFAULTS)
 from recondet.vggt_ground_truth import mean_point_distance, transform_points
@@ -31,6 +33,14 @@ from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.pose_enc import encoding_to_camera
 
 device = get_device()
+
+
+def resolve_reconstruction_query_dims(semantic_encoder):
+    query_dims = int(
+        semantic_encoder.model.bbox_head.reconstruction_dims)
+    if query_dims <= 0:
+        raise ValueError('reconstruction query dimensions must be positive')
+    return query_dims
 
 
 @MODELS.register_module()
@@ -56,12 +66,9 @@ class ReconDet(Base3DDetector):
             query_clustering_cfg=None,
             query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
             gt_points_dir=None,
-            supervise_2d_bbox=True,
-            train_2d_only=False,
             reconstruction_depth_loss_weight=1.0,
             reconstruction_point_loss_weight=0.5,
-            supervise_instance_consistency=False,
-            instance_consistency_cfg=None,
+            reconstruction_object_head_cfg=None,
             scene_query_exchange_cfg=None,
             supervise_camera_head=False,
             camera_loss_cfg=None,
@@ -108,20 +115,20 @@ class ReconDet(Base3DDetector):
             config=g_dino_cfg['grounding_dino_config'],
             checkpoint=g_dino_cfg['grounding_dino_checkpoint'],
             classes=g_dino_cfg['semantic_classes'],
-            supervise_2d_bbox=supervise_2d_bbox,
             reconstruction_depth_loss_weight=(
                 reconstruction_depth_loss_weight),
             reconstruction_point_loss_weight=(
                 reconstruction_point_loss_weight),
-            supervise_instance_consistency=(
-                supervise_instance_consistency),
-            instance_consistency_cfg=instance_consistency_cfg,
             scene_query_exchange_cfg=scene_query_exchange_cfg,
             supervise_confident_query_depth=(
                 supervise_confident_query_depth),
             confident_query_depth_cfg=confident_query_depth_cfg)
-        self.train_2d_only = bool(train_2d_only)
         semantic_query_dims = self.semantic_encoder.model.embed_dims
+        reconstruction_query_dims = resolve_reconstruction_query_dims(
+            self.semantic_encoder)
+        object_head_cfg = dict(reconstruction_object_head_cfg or {})
+        self.reconstruction_object_head = ReconstructionObjectHead(
+            query_dims=reconstruction_query_dims, **object_head_cfg)
         self.semantic_query_projection = torch.nn.Linear(
             semantic_query_dims, token_dim)
         self.detection_query_norm = torch.nn.LayerNorm(token_dim)
@@ -328,6 +335,17 @@ class ReconDet(Base3DDetector):
             score_threshold=self.reconstruction_query_score_thr,
             min_queries=self.num_queries)
 
+    def _compute_reconstruction_object_losses(
+            self, reconstruction_outputs, batch_data_samples, num_views):
+        matches = reconstruction_outputs.get('reconstruction_matches')
+        if matches is None:
+            raise RuntimeError(
+                'Object reconstruction supervision requires 2D matches')
+        samples = collect_matched_object_samples(
+            reconstruction_outputs, matches, batch_data_samples, num_views)
+        losses, _ = self.reconstruction_object_head.loss(samples)
+        return losses
+
     def _fuse_detection_queries(self, reconstruction_query,
                                 semantic_query_2d):
         projected_semantic = self.semantic_query_projection(
@@ -396,14 +414,6 @@ class ReconDet(Base3DDetector):
 
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
-        if self.train_2d_only:
-            semantic_losses = self.semantic_encoder.loss(
-                batch_inputs_dict['imgs'],
-                batch_data_samples,
-                return_reconstruction=False)
-            return {f'gdino_{name}': value
-                    for name, value in semantic_losses.items()}
-
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'train')
         vggt_feature_maps = self.feature_projector(
@@ -436,6 +446,10 @@ class ReconDet(Base3DDetector):
                 **self.camera_loss_cfg))
         reconstruction_outputs = self._align_reconstruction_outputs(
             reconstruction_outputs, batch_inputs_dict, img)
+        object_losses = self._compute_reconstruction_object_losses(
+            reconstruction_outputs, batch_data_samples, img.shape[1])
+        losses.update({f'gdino_{name}': value
+                       for name, value in object_losses.items()})
         selected_reconstruction = self._select_reconstruction_queries(
             reconstruction_outputs, img)
         query_xyz, _, query = (
@@ -456,13 +470,6 @@ class ReconDet(Base3DDetector):
 
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                 **kwargs) -> SampleList:
-
-        if self.train_2d_only:
-            if batch_data_samples and 'view_img_ids' in batch_data_samples[0].metainfo:
-                return self.semantic_encoder.predict_scene_2d(
-                    batch_inputs_dict['imgs'], batch_data_samples)
-            return self.semantic_encoder.predict_2d(
-                batch_inputs_dict['imgs'], batch_data_samples)
 
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'test')

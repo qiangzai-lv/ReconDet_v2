@@ -61,7 +61,6 @@ def _gt_inverse_components(reference, first_frame_pose, axis_align_matrix,
     return scale_matrix, normalized_to_aligned, scene_scale
 
 
-@torch.no_grad()
 def denormalize_vggt_gt_points(points, first_frame_pose, axis_align_matrix,
                                scene_scale):
     """Invert BuildVGGTGroundTruth's first-camera point normalization."""

@@ -8,7 +8,6 @@ from .recondet_head import ReconDetHead
 from .grounding_dino_head import ReconGroundingDINOHead
 
 from .recon_grounding_dino import ReconGroundingDINO
-from .scene_coco_metric import SceneCocoMetric
 
 
 __all__ = [
@@ -16,5 +15,5 @@ __all__ = [
     'LoadFirstFramePose', 'MultiViewPipeline', 'BuildVGGTGroundTruth',
     'PackNeRFDetInputs',
     'ReconDetDataPreprocessor', 'ReconDetHead', 'ReconGroundingDINO',
-    'ReconGroundingDINOHead', 'SceneCocoMetric',
+    'ReconGroundingDINOHead',
 ]

@@ -71,7 +71,8 @@ class PackNeRFDetInputs(BaseTransform):
     ]
 
     INSTANCEDATA_3D_KEYS = [
-        'gt_bboxes_3d', 'gt_labels_3d', 'attr_labels', 'depths', 'centers_2d'
+        'gt_bboxes_3d', 'gt_labels_3d', 'gt_instance_ids_3d',
+        'attr_labels', 'depths', 'centers_2d'
     ]
     INSTANCEDATA_2D_KEYS = [
         'gt_bboxes',
@@ -271,7 +272,9 @@ class PackNeRFDetInputs(BaseTransform):
         for key in [
                 'proposals', 'gt_bboxes', 'gt_bboxes_ignore', 'gt_labels',
                 'gt_bboxes_labels', 'attr_labels', 'pts_instance_mask',
-                'pts_semantic_mask', 'centers_2d', 'depths', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'avg_distance'
+                'pts_semantic_mask', 'centers_2d', 'depths', 'gt_labels_3d',
+                'gt_instance_ids_3d', 'pose_matrix', 'axis_align_matrix',
+                'avg_distance'
         ]:
             if key not in results:
                 continue

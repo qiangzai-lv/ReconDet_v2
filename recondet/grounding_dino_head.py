@@ -1,9 +1,7 @@
-import math
 from typing import Dict, List
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 
 from mmdet.models.dense_heads.grounding_dino_head import GroundingDINOHead
@@ -11,7 +9,7 @@ from mmdet.models.dense_heads.atss_vlfusion_head import (
     convert_grounding_to_cls_scores)
 from mmdet.registry import MODELS
 from mmdet.structures import SampleList
-from mmdet.structures.bbox import bbox_cxcywh_to_xyxy, bbox_overlaps
+from mmdet.structures.bbox import bbox_cxcywh_to_xyxy
 from mmdet.utils import reduce_mean
 from mmengine.structures import InstanceData
 
@@ -27,219 +25,6 @@ CONFIDENT_QUERY_DEPTH_DEFAULTS = dict(
     abs_depth_tolerance=0.05,
     rel_depth_tolerance=0.01,
 )
-
-INSTANCE_CONSISTENCY_DEFAULTS = dict(
-    embedding_dims=128,
-    temperature=0.1,
-    loss_weight=0.1,
-    background_max_iou=0.3,
-    background_ratio=2.0,
-    min_background=8,
-    max_background=32,
-)
-
-
-def sample_unmatched_background_queries(
-        bbox_preds, batch_gt_instances, matches, batch_img_metas,
-        max_iou=0.3, ratio=2.0, min_samples=8, max_samples=32):
-    """Randomly sample unmatched queries that do not overlap a GT object."""
-    if bbox_preds.ndim != 3 or bbox_preds.shape[-1] != 4:
-        raise ValueError('bbox_preds must have shape [N, Q, 4]')
-    num_views, num_queries = bbox_preds.shape[:2]
-    if not (len(batch_gt_instances) == len(matches)
-            == len(batch_img_metas) == num_views):
-        raise ValueError('background sampling inputs must match N views')
-    if not 0 <= max_iou <= 1:
-        raise ValueError('max_iou must be between 0 and 1')
-    if ratio < 0 or min_samples < 0 or max_samples < min_samples:
-        raise ValueError('invalid background sampling limits')
-
-    sampled_indices = []
-    for view_index, ((matched_queries, _), gt_instances, img_meta) in enumerate(
-            zip(matches, batch_gt_instances, batch_img_metas)):
-        candidate_mask = torch.ones(
-            num_queries, dtype=torch.bool, device=bbox_preds.device)
-        candidate_mask[matched_queries] = False
-
-        gt_bboxes = gt_instances.bboxes.to(bbox_preds.device)
-        if len(gt_bboxes) > 0:
-            img_h, img_w = img_meta['img_shape'][:2]
-            factor = bbox_preds.new_tensor([img_w, img_h, img_w, img_h])
-            pred_bboxes = (
-                bbox_cxcywh_to_xyxy(bbox_preds[view_index]) * factor)
-            max_overlaps = bbox_overlaps(
-                pred_bboxes, gt_bboxes).amax(dim=1)
-            candidate_mask &= max_overlaps < float(max_iou)
-
-        candidates = torch.nonzero(
-            candidate_mask, as_tuple=False).squeeze(-1)
-        requested = max(
-            int(min_samples),
-            math.ceil(float(ratio) * matched_queries.numel()))
-        sample_count = min(candidates.numel(), int(max_samples), requested)
-        if sample_count:
-            order = torch.randperm(
-                candidates.numel(), device=candidates.device)[:sample_count]
-            candidates = candidates[order]
-        else:
-            candidates = candidates[:0]
-        sampled_indices.append(candidates)
-    return sampled_indices
-
-
-def compute_scene_local_supcon_loss(
-        embeddings, instance_ids, scene_indices, view_indices, is_background,
-        temperature=0.1):
-    """Compute SupCon with cross-view positives and scene-local negatives."""
-    if embeddings.ndim != 2:
-        raise ValueError('embeddings must have shape [M, D]')
-    expected_shape = (len(embeddings),)
-    for name, value in (
-            ('instance_ids', instance_ids),
-            ('scene_indices', scene_indices),
-            ('view_indices', view_indices),
-            ('is_background', is_background)):
-        if value.shape != expected_shape:
-            raise ValueError(f'{name} must have shape [M]')
-    if temperature <= 0:
-        raise ValueError('temperature must be positive')
-
-    zero = embeddings.float().sum() * 0.0
-    if len(embeddings) == 0:
-        return dict(
-            loss=zero,
-            anchor_count=zero.detach(),
-            positive_pair_count=zero.detach(),
-            positive_similarity=zero.detach(),
-            negative_similarity=zero.detach())
-
-    normalized = F.normalize(embeddings.float(), dim=-1)
-    similarity = normalized @ normalized.transpose(0, 1)
-    valid_identity = (~is_background.bool()) & (instance_ids >= 0)
-    same_scene = scene_indices[:, None] == scene_indices[None, :]
-    same_instance = instance_ids[:, None] == instance_ids[None, :]
-    different_view = view_indices[:, None] != view_indices[None, :]
-    positive_mask = (
-        same_scene & same_instance & different_view
-        & valid_identity[:, None] & valid_identity[None, :])
-
-    eye = torch.eye(
-        len(embeddings), dtype=torch.bool, device=embeddings.device)
-    same_instance_same_view = (
-        same_scene & same_instance & ~different_view
-        & valid_identity[:, None] & valid_identity[None, :])
-    valid_candidate = valid_identity | is_background.bool()
-    candidate_mask = (
-        same_scene & ~eye & ~same_instance_same_view
-        & valid_candidate[None, :])
-    valid_anchor = valid_identity & positive_mask.any(dim=1)
-
-    if not valid_anchor.any():
-        return dict(
-            loss=zero,
-            anchor_count=zero.detach(),
-            positive_pair_count=zero.detach(),
-            positive_similarity=zero.detach(),
-            negative_similarity=zero.detach())
-
-    logits = similarity / float(temperature)
-    log_denominator = logits.masked_fill(
-        ~candidate_mask, -torch.inf).logsumexp(dim=1)
-    positive_count = positive_mask.sum(dim=1).clamp_min(1)
-    positive_logits = (logits * positive_mask).sum(dim=1) / positive_count
-    loss = (log_denominator - positive_logits)[valid_anchor].mean()
-
-    anchor_positive_mask = positive_mask & valid_anchor[:, None]
-    negative_mask = (
-        candidate_mask & ~positive_mask & valid_anchor[:, None])
-    positive_similarity = similarity[anchor_positive_mask].mean()
-    if negative_mask.any():
-        negative_similarity = similarity[negative_mask].mean()
-    else:
-        negative_similarity = zero.detach()
-    return dict(
-        loss=loss,
-        anchor_count=valid_anchor.sum().float().detach(),
-        positive_pair_count=anchor_positive_mask.sum().float().detach(),
-        positive_similarity=positive_similarity.detach(),
-        negative_similarity=negative_similarity.detach())
-
-
-def compute_matched_instance_consistency_loss(
-        query_embeddings, batch_gt_instances, matches, background_indices,
-        batch_data_samples, temperature=0.1):
-    """Build scene-aware identity labels from final Hungarian assignments."""
-    if query_embeddings.ndim != 3:
-        raise ValueError('query_embeddings must have shape [N, Q, D]')
-    num_views = len(query_embeddings)
-    if not (len(batch_gt_instances) == len(matches)
-            == len(background_indices) == len(batch_data_samples)
-            == num_views):
-        raise ValueError('instance consistency inputs must match N views')
-
-    embedding_parts = []
-    instance_id_parts = []
-    scene_parts = []
-    view_parts = []
-    background_parts = []
-    device = query_embeddings.device
-    for view_embeddings, gt_instances, match, background, sample in zip(
-            query_embeddings, batch_gt_instances, matches,
-            background_indices, batch_data_samples):
-        if not hasattr(sample, 'scene_batch_index') or not hasattr(
-                sample, 'view_index'):
-            raise RuntimeError(
-                'instance consistency requires scene and view indices')
-        scene_index = int(sample.scene_batch_index)
-        view_index = int(sample.view_index)
-        query_indices, gt_indices = match
-        gt_instance_ids = gt_instances.instance_ids_3d.to(device)
-        matched_ids = gt_instance_ids[gt_indices]
-        valid = matched_ids >= 0
-        if valid.any():
-            identity_embeddings = view_embeddings[query_indices[valid]]
-            identity_ids = matched_ids[valid].long()
-            count = len(identity_embeddings)
-            embedding_parts.append(identity_embeddings)
-            instance_id_parts.append(identity_ids)
-            scene_parts.append(torch.full(
-                (count,), scene_index, dtype=torch.long, device=device))
-            view_parts.append(torch.full(
-                (count,), view_index, dtype=torch.long, device=device))
-            background_parts.append(torch.zeros(
-                count, dtype=torch.bool, device=device))
-        if background.numel():
-            background = background.to(device)
-            count = background.numel()
-            embedding_parts.append(view_embeddings[background])
-            instance_id_parts.append(torch.full(
-                (count,), -1, dtype=torch.long, device=device))
-            scene_parts.append(torch.full(
-                (count,), scene_index, dtype=torch.long, device=device))
-            view_parts.append(torch.full(
-                (count,), view_index, dtype=torch.long, device=device))
-            background_parts.append(torch.ones(
-                count, dtype=torch.bool, device=device))
-
-    if embedding_parts:
-        embeddings = torch.cat(embedding_parts)
-        instance_ids = torch.cat(instance_id_parts)
-        scene_indices = torch.cat(scene_parts)
-        view_indices = torch.cat(view_parts)
-        is_background = torch.cat(background_parts)
-    else:
-        embeddings = query_embeddings.reshape(-1, query_embeddings.shape[-1])[:0]
-        instance_ids = torch.empty(0, dtype=torch.long, device=device)
-        scene_indices = torch.empty(0, dtype=torch.long, device=device)
-        view_indices = torch.empty(0, dtype=torch.long, device=device)
-        is_background = torch.empty(0, dtype=torch.bool, device=device)
-
-    result = compute_scene_local_supcon_loss(
-        embeddings, instance_ids, scene_indices, view_indices,
-        is_background, temperature=temperature)
-    result['background_count'] = is_background.sum().float().detach()
-    return result
-
 
 def compute_adaptive_depth_window_sizes(
         bbox_preds, image_shapes, window_fraction=0.1,
@@ -585,8 +370,10 @@ class GroundingDINOQueryDepthHead(nn.Module):
 class ReconGroundingDINOHead(GroundingDINOHead):
 
     def __init__(self, contrastive_cfg=dict(max_text_len=256), **kwargs):
-        self.supervise_2d_bbox = bool(kwargs.pop(
-            'supervise_2d_bbox', True))
+        instance_embedding_dims = int(kwargs.pop(
+            'instance_embedding_dims', 128))
+        if instance_embedding_dims <= 0:
+            raise ValueError('instance_embedding_dims must be positive')
         self.reconstruction_dims = kwargs.pop('reconstruction_dims', 512)
         self.log_depth_range = kwargs.pop(
             'log_depth_range', (-6.0, 6.0))
@@ -597,20 +384,6 @@ class ReconGroundingDINOHead(GroundingDINOHead):
         self.supervise_confident_query_depth = bool(kwargs.pop(
             'supervise_confident_query_depth', False))
         confident_depth_cfg = kwargs.pop('confident_query_depth_cfg', None)
-        self.supervise_instance_consistency = bool(kwargs.pop(
-            'supervise_instance_consistency', False))
-        instance_consistency_cfg = kwargs.pop(
-            'instance_consistency_cfg', None)
-        self.instance_consistency_cfg = dict(INSTANCE_CONSISTENCY_DEFAULTS)
-        if instance_consistency_cfg is not None:
-            unknown_keys = (
-                set(instance_consistency_cfg)
-                - set(self.instance_consistency_cfg))
-            if unknown_keys:
-                raise ValueError(
-                    'Unknown instance_consistency_cfg keys: '
-                    f'{sorted(unknown_keys)}')
-            self.instance_consistency_cfg.update(instance_consistency_cfg)
         self.confident_query_depth_cfg = dict(
             CONFIDENT_QUERY_DEPTH_DEFAULTS)
         if confident_depth_cfg is not None:
@@ -622,14 +395,10 @@ class ReconGroundingDINOHead(GroundingDINOHead):
                     f'{sorted(unknown_keys)}')
             self.confident_query_depth_cfg.update(confident_depth_cfg)
         super().__init__(contrastive_cfg=contrastive_cfg, **kwargs)
-        embedding_dims = int(
-            self.instance_consistency_cfg['embedding_dims'])
-        if embedding_dims <= 0:
-            raise ValueError('embedding_dims must be positive')
         self.instance_projection = nn.Sequential(
             nn.Linear(self.embed_dims, self.embed_dims),
             nn.GELU(),
-            nn.Linear(self.embed_dims, embedding_dims))
+            nn.Linear(self.embed_dims, instance_embedding_dims))
         self.reconstruction_head = GroundingDINOQueryDepthHead(
             query_dims=self.reconstruction_dims,
             log_depth_range=self.log_depth_range)
@@ -640,16 +409,27 @@ class ReconGroundingDINOHead(GroundingDINOHead):
             hidden_states, references, memory_text, text_token_mask)
         self._last_cls_scores = outputs[0].detach()
         self._last_bbox_preds = outputs[1].detach()
+        self._last_instance_embeddings = self.instance_projection(
+            hidden_states[-1]).detach()
         return outputs
 
     def predict_reconstruction(self, reconstruction_hidden_states,
                                reference_points, extrinsics, intrinsics,
-                               image_shapes):
+                               image_shapes, instance_embeddings=None):
         outputs = self.reconstruction_head(
             reconstruction_hidden_states[-1], reference_points,
             extrinsics, intrinsics, image_shapes)
         outputs['reconstruction_query'] = reconstruction_hidden_states[-1]
         outputs['hidden_states'] = reconstruction_hidden_states
+        query_count = reference_points.shape[1]
+        if instance_embeddings is None:
+            instance_embeddings = self._last_instance_embeddings[
+                :, -query_count:]
+        if instance_embeddings.shape[:2] != (reference_points.shape[0],
+                                              query_count):
+            raise RuntimeError(
+                'Instance embeddings must align with reconstruction queries')
+        outputs['instance_embeddings_2d'] = instance_embeddings
         return outputs
 
     def loss(self, hidden_states: Tensor, references: List[Tensor],
@@ -658,59 +438,8 @@ class ReconGroundingDINOHead(GroundingDINOHead):
              batch_data_samples: SampleList, dn_meta: Dict[str, int],
              reconstruction_hidden_states: Tensor = None,
              reconstruction_outputs: Dict[str, Tensor] = None) -> dict:
-        detection_loss_enabled = getattr(
-            self, 'supervise_2d_bbox', True)
-        if detection_loss_enabled:
-            losses = super().loss(
-                hidden_states=hidden_states,
-                references=references,
-                memory_text=memory_text,
-                text_token_mask=text_token_mask,
-                enc_outputs_class=enc_outputs_class,
-                enc_outputs_coord=enc_outputs_coord,
-                batch_data_samples=batch_data_samples,
-                dn_meta=dn_meta)
-        else:
-            self.forward(
-                hidden_states, references, memory_text, text_token_mask)
-            losses = {}
-        if self.supervise_instance_consistency:
-            num_denoising_queries = (
-                int(dn_meta['num_denoising_queries'])
-                if dn_meta is not None else 0)
-            matching_hidden_states = hidden_states[
-                -1, :, num_denoising_queries:]
-            matching_cls_scores = self._last_cls_scores[
-                -1, :, num_denoising_queries:]
-            matching_bbox_preds = self._last_bbox_preds[
-                -1, :, num_denoising_queries:]
-            batch_gt_instances = [
-                sample.gt_instances for sample in batch_data_samples]
-            batch_img_metas = [
-                sample.metainfo for sample in batch_data_samples]
-            matches = match_reconstruction_queries(
-                self.assigner, matching_cls_scores, matching_bbox_preds,
-                batch_gt_instances, batch_img_metas)
-            cfg = self.instance_consistency_cfg
-            background_indices = sample_unmatched_background_queries(
-                matching_bbox_preds, batch_gt_instances, matches,
-                batch_img_metas,
-                max_iou=cfg['background_max_iou'],
-                ratio=cfg['background_ratio'],
-                min_samples=cfg['min_background'],
-                max_samples=cfg['max_background'])
-            query_embeddings = self.instance_projection(
-                matching_hidden_states)
-            instance_result = compute_matched_instance_consistency_loss(
-                query_embeddings, batch_gt_instances, matches,
-                background_indices, batch_data_samples,
-                temperature=cfg['temperature'])
-            losses['loss_instance_consistency'] = (
-                instance_result['loss'] * float(cfg['loss_weight']))
-            for name in (
-                    'anchor_count', 'positive_pair_count', 'background_count',
-                    'positive_similarity', 'negative_similarity'):
-                losses[f'instance_{name}'] = instance_result[name]
+        self.forward(hidden_states, references, memory_text, text_token_mask)
+        losses = {}
         if reconstruction_outputs is None:
             return losses
 
@@ -725,6 +454,7 @@ class ReconGroundingDINOHead(GroundingDINOHead):
         matches = match_reconstruction_queries(
             self.assigner, cls_scores, bbox_preds,
             batch_gt_instances, batch_img_metas)
+        reconstruction_outputs['reconstruction_matches'] = matches
         losses.update(compute_matched_reconstruction_losses(
             reconstruction_outputs, batch_gt_instances, matches,
             depth_weight=self.reconstruction_depth_loss_weight,

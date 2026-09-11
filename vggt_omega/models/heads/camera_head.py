@@ -46,7 +46,8 @@ class CameraHead(nn.Module):
         self,
         aggregated_tokens_list: list[torch.Tensor | None],
         patch_token_start: int,
-    ) -> torch.Tensor:
+        return_camera_tokens: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         tokens = aggregated_tokens_list[-1]
         if tokens is None:
             raise ValueError("Aggregator did not cache the final layer, which CameraHead needs.")
@@ -70,7 +71,10 @@ class CameraHead(nn.Module):
 
         camera_and_register_tokens = camera_and_register_tokens.reshape(batch_size, num_frames, patch_token_start, -1)
         camera_tokens = self.trunk_norm(camera_and_register_tokens[:, :, 0])
-        return _apply_camera_activation(self.camera_branch(camera_tokens))
+        pose_encoding = _apply_camera_activation(self.camera_branch(camera_tokens))
+        if return_camera_tokens:
+            return pose_encoding, camera_tokens
+        return pose_encoding
 
 
 def _apply_camera_activation(raw_camera: torch.Tensor) -> torch.Tensor:

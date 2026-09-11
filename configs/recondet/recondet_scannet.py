@@ -267,7 +267,7 @@ test_evaluator = val_evaluator
 # train cfg
 _warm_epoch = 0
 _max_epoch = 200
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=1)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=2)
 test_cfg = dict()
 val_cfg = dict()
 

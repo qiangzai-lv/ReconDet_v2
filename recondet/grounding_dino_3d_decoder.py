@@ -103,16 +103,14 @@ class FourierPositionEmbedding2D(nn.Module):
             persistent=False)
         fourier_dims = 2 + 2 * num_bands * 2
         self.projection = nn.Linear(fourier_dims, embed_dims)
-        self.norm = nn.LayerNorm(embed_dims)
 
-    def forward(self, query, reference_points):
+    def forward(self, reference_points):
         uv = reference_points.float()
         scaled = uv.unsqueeze(-1) * self.frequencies.view(1, 1, 1, -1)
         encoded = torch.cat(
             [uv.unsqueeze(-1), scaled.sin(), scaled.cos()], dim=-1)
         encoded = encoded.flatten(start_dim=2)
-        encoded = self.projection(encoded).to(query.dtype)
-        return self.norm(query + encoded)
+        return self.projection(encoded)
 
 
 def recover_feature_maps(memory, spatial_shapes):
@@ -329,13 +327,19 @@ class GroundingDINO3DDecoder(nn.Module):
     def __init__(self, num_queries, query_dims=512, semantic_dims=256,
                  spatial_dims=512, num_layers=6, num_heads=8,
                  feedforward_channels=2048, num_feature_levels=4,
-                 num_points=4, dropout=0.0):
+                 num_points=4, dropout=0.0, camera_dims=2048,
+                 uv_num_bands=8):
         super().__init__()
+        self.camera_dims = int(camera_dims)
         self.num_queries = num_queries
         self.semantic_query_projection = nn.Linear(semantic_dims, query_dims)
         self.query_embedding = nn.Embedding(num_queries, query_dims)
         self.init_norm = nn.LayerNorm(query_dims)
-        self.query_position_embedding = FourierPositionEmbedding2D(query_dims)
+        self.query_position_embedding = FourierPositionEmbedding2D(
+            query_dims, num_bands=uv_num_bands)
+        self.camera_init_projection = nn.Sequential(
+            nn.Linear(camera_dims, camera_dims // 2), nn.GELU(),
+            nn.Linear(camera_dims // 2, query_dims))
         self.reference_projection = nn.Sequential(
             nn.Linear(semantic_dims, query_dims),
             nn.ReLU(),
@@ -359,7 +363,7 @@ class GroundingDINO3DDecoder(nn.Module):
             layer.spatial_attention.attention.init_weights()
             layer.cross_view_attention.attention.init_weights()
 
-    def initialize_query(self, semantic_query, reference_points):
+    def initialize_query(self, semantic_query, reference_points, camera_tokens):
         if semantic_query.ndim != 3:
             raise ValueError('semantic_query must have shape [N, Q, C]')
         if semantic_query.shape[1] != self.num_queries:
@@ -368,15 +372,21 @@ class GroundingDINO3DDecoder(nn.Module):
         if reference_points.shape != semantic_query.shape[:2] + (2,):
             raise ValueError(
                 'reference_points must have shape [N, Q, 2] matching query')
+        if camera_tokens is None or camera_tokens.shape != (
+                semantic_query.shape[0], self.camera_dims):
+            raise ValueError('camera_tokens must have shape [B*V, camera_dims]')
         learned_query = self.query_embedding.weight[None].expand(
             semantic_query.shape[0], -1, -1)
         projected_semantic = self.semantic_query_projection(semantic_query)
-        query = self.init_norm(learned_query + projected_semantic)
-        return self.query_position_embedding(query, reference_points)
+        projected_uv = self.query_position_embedding(reference_points)
+        projected_camera = self.camera_init_projection(camera_tokens)
+        return self.init_norm(
+            learned_query + projected_semantic + projected_uv
+            + projected_camera[:, None, :])
 
     def forward(self, semantic_query, spatial_features, reference_points,
                 valid_ratios, instance_embeddings=None, num_views=1,
-                correspondence_temperature=0.07):
+                correspondence_temperature=0.07, camera_tokens=None):
         if num_views <= 0:
             raise ValueError('num_views must be positive')
         if semantic_query.shape[0] % num_views != 0:
@@ -410,7 +420,8 @@ class GroundingDINO3DDecoder(nn.Module):
                 coordinate_to_encoding(flat_cross_references)).reshape(
                     batch_size, num_views, self.num_queries, num_views, -1)
 
-        query = self.initialize_query(semantic_query, reference_points)
+        query = self.initialize_query(
+            semantic_query, reference_points, camera_tokens)
         query_pos = self.reference_projection(
             coordinate_to_encoding(reference_points))
         spatial_key_padding_mask = build_spatial_key_padding_mask(

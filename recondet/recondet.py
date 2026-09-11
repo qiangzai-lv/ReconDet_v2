@@ -66,14 +66,13 @@ class ReconDet(Base3DDetector):
             query_clustering_cfg=None,
             query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
             gt_points_dir=None,
-            reconstruction_depth_loss_weight=1.0,
             reconstruction_point_loss_weight=0.5,
             reconstruction_object_head_cfg=None,
             scene_query_exchange_cfg=None,
             supervise_camera_head=False,
             camera_loss_cfg=None,
-            supervise_confident_query_depth=False,
-            confident_query_depth_cfg=None,
+            supervise_confident_query_point=False,
+            confident_query_point_cfg=None,
             prediction_visualization=False,
             prediction_visualization_dir='work_dirs/recondet_visualizations',
             prediction_visualization_score_thr=0.1,
@@ -115,14 +114,14 @@ class ReconDet(Base3DDetector):
             config=g_dino_cfg['grounding_dino_config'],
             checkpoint=g_dino_cfg['grounding_dino_checkpoint'],
             classes=g_dino_cfg['semantic_classes'],
-            reconstruction_depth_loss_weight=(
-                reconstruction_depth_loss_weight),
+            camera_dims=(
+                self.vggt_encoder.camera_head.trunk_norm.normalized_shape[0]),
             reconstruction_point_loss_weight=(
                 reconstruction_point_loss_weight),
             scene_query_exchange_cfg=scene_query_exchange_cfg,
-            supervise_confident_query_depth=(
-                supervise_confident_query_depth),
-            confident_query_depth_cfg=confident_query_depth_cfg)
+            supervise_confident_query_point=(
+                supervise_confident_query_point),
+            confident_query_point_cfg=confident_query_point_cfg)
         semantic_query_dims = self.semantic_encoder.model.embed_dims
         reconstruction_query_dims = resolve_reconstruction_query_dims(
             self.semantic_encoder)
@@ -277,12 +276,13 @@ class ReconDet(Base3DDetector):
             for token in vggt_token_list
         ]
         camera_grad_enabled = (
-            self.supervise_camera_head and self.training
-            and torch.is_grad_enabled())
+            self.training and torch.is_grad_enabled()
+            and (self.supervise_camera_head or self.vggt_lora_enabled))
         with torch.set_grad_enabled(camera_grad_enabled):
             with autocast(images.device, enabled=False):
-                pose_encoding = self.vggt_encoder.camera_head(
-                    cached_tokens, patch_token_start=ps_idx)
+                pose_encoding, camera_tokens = self.vggt_encoder.camera_head(
+                    cached_tokens, patch_token_start=ps_idx,
+                    return_camera_tokens=True)
 
         with torch.no_grad(), autocast(images.device, enabled=False):
             extrinsics, intrinsics = encoding_to_camera(
@@ -304,7 +304,7 @@ class ReconDet(Base3DDetector):
         batch_inputs_dict['vggt_intrinsics'] = intrinsics.detach()
         del cached_tokens
         cameras = (extrinsics.detach(), aligned_extrinsics.detach(),
-                   intrinsics.detach())
+                   intrinsics.detach(), camera_tokens)
         if return_pose_encoding:
             return cameras + (pose_encoding,)
         return cameras
@@ -418,7 +418,7 @@ class ReconDet(Base3DDetector):
             batch_inputs_dict, batch_data_samples, 'train')
         vggt_feature_maps = self.feature_projector(
             vggt_token_list, img, ps_idx)
-        raw_extrinsics, extrinsics, intrinsics, pose_encoding = (
+        _, extrinsics, intrinsics, camera_tokens, pose_encoding = (
             self._build_projection_cameras(
                 vggt_token_list, ps_idx, img, batch_inputs_dict,
                 batch_data_samples, return_pose_encoding=True))
@@ -427,8 +427,9 @@ class ReconDet(Base3DDetector):
                 batch_inputs_dict['imgs'],
                 batch_data_samples,
                 vggt_feature_maps=vggt_feature_maps,
-                vggt_extrinsics=raw_extrinsics,
-                vggt_intrinsics=intrinsics,
+                camera_tokens=camera_tokens,
+                gt_extrinsics_vggt=batch_inputs_dict['gt_extrinsics_vggt'],
+                gt_intrinsics=batch_inputs_dict['gt_intrinsics'],
                 gt_depths_vggt=batch_inputs_dict['gt_depths_vggt'],
                 gt_depth_valid_masks=(
                     batch_inputs_dict['gt_depth_valid_masks']),
@@ -475,13 +476,14 @@ class ReconDet(Base3DDetector):
             batch_inputs_dict, batch_data_samples, 'test')
         vggt_feature_maps = self.feature_projector(
             vggt_token_list, img, ps_idx)
-        raw_extrinsics, extrinsics, intrinsics = self._build_projection_cameras(
-            vggt_token_list, ps_idx, img, batch_inputs_dict,
-            batch_data_samples)
+        _, extrinsics, intrinsics, camera_tokens = (
+            self._build_projection_cameras(
+                vggt_token_list, ps_idx, img, batch_inputs_dict,
+                batch_data_samples))
         reconstruction_outputs, view_predictions = (
             self.semantic_encoder.predict_reconstruction(
                 batch_inputs_dict['imgs'], batch_data_samples,
-                vggt_feature_maps, raw_extrinsics, intrinsics))
+                vggt_feature_maps, camera_tokens))
         reconstruction_outputs = self._align_reconstruction_outputs(
             reconstruction_outputs, batch_inputs_dict, img)
         selected_reconstruction = self._select_reconstruction_queries(
@@ -552,14 +554,15 @@ class ReconDet(Base3DDetector):
             batch_inputs_dict, batch_data_samples, 'train')
         vggt_feature_maps = self.feature_projector(
             vggt_token_list, img, ps_idx)
-        raw_extrinsics, extrinsics, intrinsics = self._build_projection_cameras(
-            vggt_token_list, ps_idx, img, batch_inputs_dict,
-            batch_data_samples)
+        _, extrinsics, intrinsics, camera_tokens = (
+            self._build_projection_cameras(
+                vggt_token_list, ps_idx, img, batch_inputs_dict,
+                batch_data_samples))
 
         reconstruction_outputs, _ = (
             self.semantic_encoder.predict_reconstruction(
                 batch_inputs_dict['imgs'], batch_data_samples,
-                vggt_feature_maps, raw_extrinsics, intrinsics))
+                vggt_feature_maps, camera_tokens))
         reconstruction_outputs = self._align_reconstruction_outputs(
             reconstruction_outputs, batch_inputs_dict, img)
         selected_reconstruction = self._select_reconstruction_queries(

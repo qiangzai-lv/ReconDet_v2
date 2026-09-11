@@ -27,8 +27,7 @@ class ReconGroundingDINO(GroundingDINO):
             self.reconstruction_decoder = GroundingDINO3DDecoder(
                 num_queries=self.num_queries, **reconstruction_decoder)
         self._active_vggt_feature_maps = None
-        self._active_vggt_extrinsics = None
-        self._active_vggt_intrinsics = None
+        self._active_camera_tokens = None
         self._active_image_shapes = None
         self._active_vggt_valid_ratios = None
         self._active_num_views = 1
@@ -71,20 +70,18 @@ class ReconGroundingDINO(GroundingDINO):
         return torch.cat([query[:, :-self.num_queries, :], exchanged], dim=1)
 
     @contextmanager
-    def _using_vggt_features(self, feature_maps, extrinsics=None,
-                             intrinsics=None, image_shapes=None,
+    def _using_vggt_features(self, feature_maps, camera_tokens=None,
+                             image_shapes=None,
                              vggt_valid_ratios=None, num_views=1):
         previous = (
             self._active_vggt_feature_maps,
-            self._active_vggt_extrinsics,
-            self._active_vggt_intrinsics,
+            self._active_camera_tokens,
             self._active_image_shapes,
             self._active_vggt_valid_ratios,
             self._active_num_views,
         )
         self._active_vggt_feature_maps = feature_maps
-        self._active_vggt_extrinsics = extrinsics
-        self._active_vggt_intrinsics = intrinsics
+        self._active_camera_tokens = camera_tokens
         self._active_image_shapes = image_shapes
         self._active_vggt_valid_ratios = vggt_valid_ratios
         self._active_num_views = int(num_views)
@@ -94,8 +91,7 @@ class ReconGroundingDINO(GroundingDINO):
             yield
         finally:
             (self._active_vggt_feature_maps,
-             self._active_vggt_extrinsics,
-             self._active_vggt_intrinsics,
+             self._active_camera_tokens,
              self._active_image_shapes,
              self._active_vggt_valid_ratios,
              self._active_num_views) = previous
@@ -106,17 +102,14 @@ class ReconGroundingDINO(GroundingDINO):
             text_dict: Dict,
             batch_data_samples: OptSampleList = None,
             vggt_feature_maps=None,
-            vggt_extrinsics=None,
-            vggt_intrinsics=None,
+            camera_tokens=None,
             image_shapes=None,
             vggt_valid_ratios=None,
             num_views=None) -> Dict:
         if vggt_feature_maps is None:
             vggt_feature_maps = self._active_vggt_feature_maps
-        if vggt_extrinsics is None:
-            vggt_extrinsics = self._active_vggt_extrinsics
-        if vggt_intrinsics is None:
-            vggt_intrinsics = self._active_vggt_intrinsics
+        if camera_tokens is None:
+            camera_tokens = self._active_camera_tokens
         if image_shapes is None:
             image_shapes = self._active_image_shapes
         if vggt_valid_ratios is None:
@@ -140,8 +133,7 @@ class ReconGroundingDINO(GroundingDINO):
         decoder_outputs_dict = self.forward_decoder(
             **decoder_inputs_dict,
             vggt_feature_maps=vggt_feature_maps,
-            vggt_extrinsics=vggt_extrinsics,
-            vggt_intrinsics=vggt_intrinsics,
+            camera_tokens=camera_tokens,
             image_shapes=image_shapes,
             vggt_valid_ratios=vggt_valid_ratios,
             num_views=num_views)
@@ -163,8 +155,7 @@ class ReconGroundingDINO(GroundingDINO):
                         memory_text: Tensor = None,
                         text_attention_mask: Tensor = None,
                         vggt_feature_maps=None,
-                        vggt_extrinsics=None,
-                        vggt_intrinsics=None,
+                        camera_tokens=None,
                         image_shapes=None,
                         vggt_valid_ratios=None,
                         num_views=1,
@@ -259,11 +250,8 @@ class ReconGroundingDINO(GroundingDINO):
                 'hidden_states': inter_states,
                 'references': list(references),
             }
-        if (vggt_extrinsics is None or vggt_intrinsics is None or
-                image_shapes is None):
-            raise RuntimeError(
-                'Query depth reconstruction requires raw VGGT cameras and '
-                'per-view image shapes')
+        if camera_tokens is None:
+            raise RuntimeError('Query point reconstruction requires VGGT camera tokens')
         semantic_query = self.decoder.norm(query)[
             :, -self.num_queries:, :]
         matching_reference_points = reference_points[
@@ -278,13 +266,11 @@ class ReconGroundingDINO(GroundingDINO):
             (vggt_valid_ratios
              if vggt_valid_ratios is not None else valid_ratios),
             instance_embeddings=instance_embeddings,
-            num_views=num_views)
+            num_views=num_views, camera_tokens=camera_tokens)
         reconstruction_outputs = self.bbox_head.predict_reconstruction(
             reconstruction_hidden_states,
             matching_reference_points,
-            vggt_extrinsics,
-            vggt_intrinsics,
-            image_shapes,
+            camera_tokens,
             instance_embeddings=instance_embeddings)
         reconstruction_outputs['detection_query_2d'] = semantic_query
         self._last_reconstruction_hidden_states = (
@@ -299,13 +285,13 @@ class ReconGroundingDINO(GroundingDINO):
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList, vggt_feature_maps=None,
-             vggt_extrinsics=None, vggt_intrinsics=None,
+             camera_tokens=None,
              image_shapes=None,
              vggt_valid_ratios=None,
              num_views=1,
              return_reconstruction=False) -> Union[dict, list]:
         with self._using_vggt_features(
-                vggt_feature_maps, vggt_extrinsics, vggt_intrinsics,
+                vggt_feature_maps, camera_tokens,
                 image_shapes, vggt_valid_ratios=vggt_valid_ratios,
                 num_views=num_views):
             losses = super().loss(batch_inputs, batch_data_samples)
@@ -321,11 +307,11 @@ class ReconGroundingDINO(GroundingDINO):
         )
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True,
-                vggt_feature_maps=None, vggt_extrinsics=None,
-                vggt_intrinsics=None, image_shapes=None,
+                vggt_feature_maps=None, camera_tokens=None,
+                image_shapes=None,
                 vggt_valid_ratios=None, num_views=1):
         with self._using_vggt_features(
-                vggt_feature_maps, vggt_extrinsics, vggt_intrinsics,
+                vggt_feature_maps, camera_tokens,
                 image_shapes, vggt_valid_ratios=vggt_valid_ratios,
                 num_views=num_views):
             return super().predict(

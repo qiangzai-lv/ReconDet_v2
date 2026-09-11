@@ -16,7 +16,7 @@ from mmengine.structures import InstanceData
 from recondet.camera_alignment import unproject_query_depth
 
 
-CONFIDENT_QUERY_DEPTH_DEFAULTS = dict(
+CONFIDENT_QUERY_POINT_DEFAULTS = dict(
     score_thr=0.05,
     loss_weight=1.0,
     window_fraction=0.1,
@@ -56,7 +56,7 @@ def _stack_depth_targets(batch_data_samples, device):
         missing = [name for name in required if not hasattr(sample, name)]
         if missing:
             raise RuntimeError(
-                f'Confident query depth supervision requires {missing}')
+                f'Confident query point supervision requires {missing}')
     depth_maps = torch.stack([
         sample.gt_depth_vggt.to(device=device, dtype=torch.float32)
         for sample in batch_data_samples
@@ -155,23 +155,23 @@ def _sample_query_depth_targets(
     return target_depth, target_valid
 
 
-def compute_confident_query_depth_loss(
+def compute_confident_query_point_loss(
         reconstruction_outputs, cls_scores, bbox_preds,
         batch_data_samples, matches, score_thr=0.05, loss_weight=1.0,
         window_fraction=0.1, min_window_size=2, max_window_size=4,
         abs_depth_tolerance=0.05, rel_depth_tolerance=0.01):
-    depth = reconstruction_outputs['depth']
+    points = reconstruction_outputs['points_vggt']
     reference_points = reconstruction_outputs['reference_points_2d']
     pred_valid = reconstruction_outputs['valid_mask']
-    if depth.ndim != 3 or depth.shape[-1] != 1:
-        raise ValueError('reconstruction depth must have shape [N, Q, 1]')
-    if reference_points.shape != depth.shape[:2] + (2,):
+    if points.ndim != 3 or points.shape[-1] != 3:
+        raise ValueError('reconstruction points must have shape [N, Q, 3]')
+    if reference_points.shape != points.shape[:2] + (2,):
         raise ValueError('reference points must have shape [N, Q, 2]')
-    if cls_scores.shape[:2] != depth.shape[:2]:
+    if cls_scores.shape[:2] != points.shape[:2]:
         raise ValueError('classification scores must match reconstruction queries')
-    if bbox_preds.shape != depth.shape[:2] + (4,):
+    if bbox_preds.shape != points.shape[:2] + (4,):
         raise ValueError('bbox predictions must have shape [N, Q, 4]')
-    if len(batch_data_samples) != len(depth) or len(matches) != len(depth):
+    if len(batch_data_samples) != len(points) or len(matches) != len(points):
         raise ValueError('depth targets and matches must match flattened views')
 
     with torch.no_grad():
@@ -188,16 +188,29 @@ def compute_confident_query_depth_loss(
             batch_data_samples, window_fraction,
             min_window_size, max_window_size,
             abs_depth_tolerance, rel_depth_tolerance)
+        # GT-only target construction; predicted cameras never enter XYZ decoding.
+        gt_extrinsics = torch.stack([
+            sample.gt_extrinsics_vggt.to(points) for sample in batch_data_samples])
+        gt_intrinsics = torch.stack([
+            sample.gt_intrinsics.to(points) for sample in batch_data_samples])
+        image_shapes = reference_points.new_tensor([
+            sample.metainfo['img_shape'][:2] for sample in batch_data_samples])
+        pixel_xy = reference_points.detach() * image_shapes[:, None, [1, 0]]
+        _, target_points = unproject_query_depth(
+            pixel_xy, torch.nan_to_num(target_depth), gt_extrinsics, gt_intrinsics)
+        target_valid &= torch.isfinite(target_points).all(dim=-1)
         selected = foreground_scores > float(score_thr)
         selected &= unmatched & pred_valid.bool()
         selected &= target_valid
         selected &= (reference_points >= 0).all(dim=-1)
         selected &= (reference_points <= 1).all(dim=-1)
 
-    prediction = depth[..., 0].float()
-    selected &= torch.isfinite(prediction) & (prediction > 0)
-    errors = (prediction - target_depth).abs()[selected]
-    zero = torch.nan_to_num(prediction).sum() * 0.0
+    prediction = points.float()
+    if not torch.isfinite(prediction).all():
+        raise FloatingPointError('Non-finite reconstruction XYZ')
+    errors = torch.linalg.vector_norm(
+        prediction[selected] - target_points[selected], dim=-1)
+    zero = prediction.sum() * 0.0
     return _distributed_valid_mean([errors], zero) * float(loss_weight)
 
 
@@ -257,109 +270,70 @@ def _distributed_valid_mean(errors, zero):
 
 
 def compute_matched_reconstruction_losses(
-        reconstruction_outputs, batch_gt_instances, matches,
-        depth_weight=1.0, point_weight=0.5):
-    depth = reconstruction_outputs['depth']
+        reconstruction_outputs, batch_gt_instances, matches, point_weight=0.5):
     points = reconstruction_outputs['points_vggt']
     pred_valid = reconstruction_outputs['valid_mask']
-    if depth.ndim != 3 or depth.shape[-1] != 1:
-        raise ValueError('reconstruction depth must have shape [N, Q, 1]')
-    if points.shape != depth.shape[:2] + (3,):
+    if points.ndim != 3 or points.shape[-1] != 3:
         raise ValueError('reconstruction points must have shape [N, Q, 3]')
-    if pred_valid.shape != depth.shape[:2]:
+    if pred_valid.shape != points.shape[:2]:
         raise ValueError('reconstruction valid mask must have shape [N, Q]')
-    if len(batch_gt_instances) != len(depth) or len(matches) != len(depth):
+    if len(batch_gt_instances) != len(points) or len(matches) != len(points):
         raise ValueError('reconstruction targets must match flattened views')
+    if not torch.isfinite(points).all():
+        raise FloatingPointError('Non-finite reconstruction XYZ')
 
-    depth_errors = []
     point_errors = []
     for view_index, (query_indices, gt_indices) in enumerate(matches):
         if query_indices.numel() == 0:
             continue
         gt_instances = batch_gt_instances[view_index]
-        pred_depth = depth[view_index, query_indices, 0].float()
-        gt_depth = gt_instances.center_depth_vggt[gt_indices].float()
-        depth_valid = gt_instances.center_depth_valid_mask[gt_indices].bool()
-        depth_valid &= torch.isfinite(pred_depth)
-        depth_valid &= torch.isfinite(gt_depth) & (gt_depth > 0)
-        if depth_valid.any():
-            depth_errors.append(
-                (pred_depth[depth_valid] - gt_depth[depth_valid]).abs())
-
         pred_points = points[view_index, query_indices].float()
         gt_points = gt_instances.centers_3d_vggt[gt_indices].float()
-        point_valid = gt_instances.center_3d_valid_mask[gt_indices].bool()
+        point_valid = gt_instances.center_3d_valid_mask[gt_indices].bool().clone()
         point_valid &= pred_valid[view_index, query_indices].bool()
-        point_valid &= torch.isfinite(pred_points).all(dim=-1)
         point_valid &= torch.isfinite(gt_points).all(dim=-1)
         if point_valid.any():
             point_errors.append(torch.linalg.vector_norm(
                 pred_points[point_valid] - gt_points[point_valid], dim=-1))
 
-    depth_zero = torch.nan_to_num(depth.float()).sum() * 0.0
-    point_zero = torch.nan_to_num(points.float()).sum() * 0.0
-    return {
-        'loss_recon_depth': (
-            _distributed_valid_mean(depth_errors, depth_zero)
-            * float(depth_weight)),
-        'loss_recon_point': (
-            _distributed_valid_mean(point_errors, point_zero)
-            * float(point_weight)),
-    }
+    point_zero = points.float().sum() * 0.0
+    return {'loss_recon_point': (
+        _distributed_valid_mean(point_errors, point_zero) * float(point_weight))}
 
 
-class GroundingDINOQueryDepthHead(nn.Module):
+class GroundingDINOQueryPointHead(nn.Module):
+    """Decode camera-conditioned queries directly in normalized VGGT coordinates."""
 
-    def __init__(self, query_dims=512, log_depth_range=(-6.0, 6.0)):
+    def __init__(self, query_dims=512, camera_dims=2048):
         super().__init__()
-        if (len(log_depth_range) != 2 or
-                log_depth_range[0] >= log_depth_range[1]):
-            raise ValueError('log_depth_range must be an increasing pair')
-        self.log_depth_range = tuple(float(value)
-                                     for value in log_depth_range)
-        self.depth_head = nn.Sequential(
-            nn.LayerNorm(query_dims),
-            nn.Linear(query_dims, query_dims // 2),
-            nn.GELU(),
-            nn.Linear(query_dims // 2, 32),
-            nn.GELU(),
-            nn.Linear(32, 1))
-        with torch.no_grad():
-            nn.init.zeros_(self.depth_head[-1].weight)
-            nn.init.zeros_(self.depth_head[-1].bias)
+        self.camera_dims = int(camera_dims)
+        # Same projection structure as VGGT CameraHead.camera_branch.
+        self.camera_output_projection = nn.Sequential(
+            nn.Linear(camera_dims, camera_dims // 2), nn.GELU(),
+            nn.Linear(camera_dims // 2, query_dims))
+        self.point_norm = nn.LayerNorm(query_dims)
+        self.point_head = nn.Sequential(
+            nn.Linear(query_dims, query_dims // 2), nn.GELU(),
+            nn.Linear(query_dims // 2, 3))
 
-    def forward(self, query, reference_points, extrinsics, intrinsics,
-                image_shapes):
-        if reference_points.shape != query.shape[:2] + (2,):
+    def forward(self, query, reference_points, camera_tokens):
+        if query.ndim != 3 or reference_points.shape != query.shape[:2] + (2,):
             raise ValueError(
                 'reference_points must have shape [N, Q, 2] matching query')
-        if image_shapes.shape != (query.shape[0], 2):
-            raise ValueError('image_shapes must have shape [N, 2]')
-
-        depth_logits = self.depth_head(query)
+        if camera_tokens is None or camera_tokens.shape != (
+                query.shape[0], self.camera_dims):
+            raise ValueError('camera_tokens must have shape [N, camera_dims]')
+        # Coordinate regression and the camera MLP run in FP32 under AMP.
         with torch.autocast(device_type=query.device.type, enabled=False):
-            depth_logits_fp32 = depth_logits.float()
-            bounded_logits = depth_logits_fp32.clamp(*self.log_depth_range)
-            bounded_logits = depth_logits_fp32 + (
-                bounded_logits - depth_logits_fp32).detach()
-            depth = bounded_logits.exp()
-
-            image_shapes = image_shapes.to(
-                device=query.device, dtype=torch.float32)
-            pixel_scale = torch.stack(
-                [image_shapes[:, 1], image_shapes[:, 0]], dim=-1)
-            pixel_xy = reference_points.float() * pixel_scale[:, None]
-            points_camera, points_vggt = unproject_query_depth(
-                pixel_xy, depth, extrinsics, intrinsics)
-
-        valid_mask = torch.isfinite(points_vggt).all(dim=-1)
-        valid_mask &= torch.isfinite(depth[..., 0]) & (depth[..., 0] > 0)
+            camera_features = self.camera_output_projection(camera_tokens.float())
+            point_query = self.point_norm(query.float() + camera_features[:, None])
+            points_vggt = self.point_head(point_query)
+        if not torch.isfinite(points_vggt).all():
+            raise FloatingPointError('Non-finite reconstruction XYZ')
+        valid_mask = torch.isfinite(reference_points).all(dim=-1)
         valid_mask &= (reference_points >= 0).all(dim=-1)
         valid_mask &= (reference_points <= 1).all(dim=-1)
         return {
-            'depth_logits': depth_logits,
-            'depth': depth,
-            'points_camera': points_camera,
             'points_vggt': points_vggt,
             'reference_points_2d': reference_points,
             'valid_mask': valid_mask,
@@ -375,33 +349,29 @@ class ReconGroundingDINOHead(GroundingDINOHead):
         if instance_embedding_dims <= 0:
             raise ValueError('instance_embedding_dims must be positive')
         self.reconstruction_dims = kwargs.pop('reconstruction_dims', 512)
-        self.log_depth_range = kwargs.pop(
-            'log_depth_range', (-6.0, 6.0))
-        self.reconstruction_depth_loss_weight = float(kwargs.pop(
-            'reconstruction_depth_loss_weight', 1.0))
+        self.camera_dims = int(kwargs.pop('camera_dims', 2048))
         self.reconstruction_point_loss_weight = float(kwargs.pop(
             'reconstruction_point_loss_weight', 0.5))
-        self.supervise_confident_query_depth = bool(kwargs.pop(
-            'supervise_confident_query_depth', False))
-        confident_depth_cfg = kwargs.pop('confident_query_depth_cfg', None)
-        self.confident_query_depth_cfg = dict(
-            CONFIDENT_QUERY_DEPTH_DEFAULTS)
-        if confident_depth_cfg is not None:
+        self.supervise_confident_query_point = bool(kwargs.pop(
+            'supervise_confident_query_point', False))
+        confident_point_cfg = kwargs.pop('confident_query_point_cfg', None)
+        self.confident_query_point_cfg = dict(
+            CONFIDENT_QUERY_POINT_DEFAULTS)
+        if confident_point_cfg is not None:
             unknown_keys = (
-                set(confident_depth_cfg) - set(self.confident_query_depth_cfg))
+                set(confident_point_cfg) - set(self.confident_query_point_cfg))
             if unknown_keys:
                 raise ValueError(
-                    'Unknown confident_query_depth_cfg keys: '
+                    'Unknown confident_query_point_cfg keys: '
                     f'{sorted(unknown_keys)}')
-            self.confident_query_depth_cfg.update(confident_depth_cfg)
+            self.confident_query_point_cfg.update(confident_point_cfg)
         super().__init__(contrastive_cfg=contrastive_cfg, **kwargs)
         self.instance_projection = nn.Sequential(
             nn.Linear(self.embed_dims, self.embed_dims),
             nn.GELU(),
             nn.Linear(self.embed_dims, instance_embedding_dims))
-        self.reconstruction_head = GroundingDINOQueryDepthHead(
-            query_dims=self.reconstruction_dims,
-            log_depth_range=self.log_depth_range)
+        self.reconstruction_head = GroundingDINOQueryPointHead(
+            query_dims=self.reconstruction_dims, camera_dims=self.camera_dims)
 
     def forward(self, hidden_states: Tensor, references: List[Tensor],
                 memory_text: Tensor, text_token_mask: Tensor):
@@ -414,11 +384,11 @@ class ReconGroundingDINOHead(GroundingDINOHead):
         return outputs
 
     def predict_reconstruction(self, reconstruction_hidden_states,
-                               reference_points, extrinsics, intrinsics,
-                               image_shapes, instance_embeddings=None):
+                               reference_points, camera_tokens,
+                               instance_embeddings=None):
         outputs = self.reconstruction_head(
             reconstruction_hidden_states[-1], reference_points,
-            extrinsics, intrinsics, image_shapes)
+            camera_tokens)
         outputs['reconstruction_query'] = reconstruction_hidden_states[-1]
         outputs['hidden_states'] = reconstruction_hidden_states
         query_count = reference_points.shape[1]
@@ -443,7 +413,7 @@ class ReconGroundingDINOHead(GroundingDINOHead):
         if reconstruction_outputs is None:
             return losses
 
-        num_matching_queries = reconstruction_outputs['depth'].shape[1]
+        num_matching_queries = reconstruction_outputs['points_vggt'].shape[1]
         cls_scores, bbox_preds = select_final_matching_outputs(
             self._last_cls_scores, self._last_bbox_preds,
             num_matching_queries)
@@ -457,12 +427,11 @@ class ReconGroundingDINOHead(GroundingDINOHead):
         reconstruction_outputs['reconstruction_matches'] = matches
         losses.update(compute_matched_reconstruction_losses(
             reconstruction_outputs, batch_gt_instances, matches,
-            depth_weight=self.reconstruction_depth_loss_weight,
             point_weight=self.reconstruction_point_loss_weight))
-        if self.supervise_confident_query_depth:
-            losses['loss_confident_query_depth'] = (
-                compute_confident_query_depth_loss(
+        if self.supervise_confident_query_point:
+            losses['loss_confident_query_point'] = (
+                compute_confident_query_point_loss(
                     reconstruction_outputs, cls_scores, bbox_preds,
                     batch_data_samples, matches,
-                    **self.confident_query_depth_cfg))
+                    **self.confident_query_point_cfg))
         return losses

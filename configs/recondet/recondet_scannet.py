@@ -208,7 +208,7 @@ test_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
-        n_images=64,
+        n_images=128,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
@@ -226,7 +226,7 @@ train_dataloader = dict(
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
         type='RepeatDataset',
-        times=1,
+        times=6,
         dataset=dict(
             type=dataset_type,
             data_root=data_root,
@@ -240,21 +240,6 @@ train_dataloader = dict(
             metainfo=dict(CLASSES=class_names))))
 
 backend_args = None
-
-test_pipeline_2d = [
-    dict(type='mmdet.LoadImageFromFile', backend_args=backend_args),
-    dict(
-        type='mmdet.Resize',
-        scale=(448, 448),
-        keep_ratio=True,
-        interpolation='bicubic'),
-    dict(type='mmdet.LoadAnnotations', with_bbox=True),
-    dict(
-        type='mmdet.PackDetInputs',
-        meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
-                   'scale_factor', 'text', 'custom_entities',
-                   'tokens_positive'))
-]
 
 val_dataloader = dict(
     batch_size=1,
@@ -308,7 +293,7 @@ param_scheduler = [
 ]
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule='greater', interval=1, max_keep_ckpts=4),
+    checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule='greater', interval=2, max_keep_ckpts=4),
     logger=dict(type='LoggerHook', interval=10)
 )
 

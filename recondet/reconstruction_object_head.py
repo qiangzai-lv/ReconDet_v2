@@ -21,6 +21,56 @@ def group_scene_instances(scene_indices: Tensor, instance_ids: Tensor):
     return unique_keys, group_indices, counts
 
 
+@torch.no_grad()
+def group_instance_embeddings(embeddings: Tensor, scene_indices: Tensor,
+                              view_indices: Tensor,
+                              similarity_threshold: float = 0.7) -> Tensor:
+    """Group reconstruction queries by cross-view embedding affinity."""
+    if embeddings.ndim != 2:
+        raise ValueError('embeddings must have shape [M, C]')
+    if scene_indices.shape != (len(embeddings),):
+        raise ValueError('scene_indices must have shape [M]')
+    if view_indices.shape != (len(embeddings),):
+        raise ValueError('view_indices must have shape [M]')
+    if not 0.0 <= similarity_threshold <= 1.0:
+        raise ValueError('similarity_threshold must be between 0 and 1')
+    if len(embeddings) == 0:
+        return torch.empty(0, dtype=torch.long, device=embeddings.device)
+
+    if not torch.isfinite(embeddings).all():
+        raise ValueError('embeddings must contain only finite values')
+    normalized = F.normalize(embeddings.float(), dim=-1)
+    scene_indices = scene_indices.detach().cpu().tolist()
+    view_indices = view_indices.detach().cpu().tolist()
+    group_members = []
+    group_scenes = []
+    group_views = []
+    assignments = []
+    for index in range(len(embeddings)):
+        best_group = -1
+        best_similarity = similarity_threshold
+        for group_id, members in enumerate(group_members):
+            if group_scenes[group_id] != scene_indices[index]:
+                continue
+            if view_indices[index] in group_views[group_id]:
+                continue
+            prototype = normalized[members].mean(dim=0)
+            similarity = torch.dot(normalized[index], F.normalize(
+                prototype, dim=0)).item()
+            if similarity >= best_similarity:
+                best_group = group_id
+                best_similarity = similarity
+        if best_group < 0:
+            best_group = len(group_members)
+            group_members.append([])
+            group_scenes.append(scene_indices[index])
+            group_views.append(set())
+        group_members[best_group].append(index)
+        group_views[best_group].add(view_indices[index])
+        assignments.append(best_group)
+    return torch.tensor(assignments, dtype=torch.long, device=embeddings.device)
+
+
 def _group_mean(values: Tensor, group_indices: Tensor,
                 num_groups: int) -> Tensor:
     output = values.new_zeros((num_groups,) + values.shape[1:])
@@ -250,7 +300,8 @@ class ReconstructionObjectHead(nn.Module):
                  instance_dims: int = 128, temperature: float = 0.07,
                  instance_weight: float = 0.2, center_weight: float = 0.5,
                  bbox_weight: float = 1.0, giou_weight: float = 0.5,
-                 min_bbox_views: int = 2, geometry_frequencies: int = 4):
+                 min_bbox_views: int = 2, geometry_frequencies: int = 4,
+                 grouping_similarity_threshold: float = 0.7):
         super().__init__()
         if min(query_dims, hidden_dims, instance_dims, min_bbox_views) <= 0:
             raise ValueError('head dimensions and min_bbox_views must be positive')
@@ -260,6 +311,11 @@ class ReconstructionObjectHead(nn.Module):
         self.bbox_weight = float(bbox_weight)
         self.giou_weight = float(giou_weight)
         self.min_bbox_views = int(min_bbox_views)
+        if not 0.0 <= grouping_similarity_threshold <= 1.0:
+            raise ValueError(
+                'grouping_similarity_threshold must be between 0 and 1')
+        self.grouping_similarity_threshold = float(
+            grouping_similarity_threshold)
 
         self.instance_projection = nn.Sequential(
             nn.LayerNorm(query_dims), nn.Linear(query_dims, hidden_dims),
@@ -285,8 +341,16 @@ class ReconstructionObjectHead(nn.Module):
 
     def forward(self, queries: Tensor, points: Tensor, group_indices: Tensor,
                 num_groups: int) -> Dict[str, Tensor]:
-        if queries.ndim != 2 or len(queries) != len(points):
+        if queries.ndim != 2 or points.shape != (len(queries), 3):
             raise ValueError('queries must have shape [M, C] matching points')
+        if group_indices.shape != (len(queries),):
+            raise ValueError('group_indices must have shape [M]')
+        if num_groups <= 0 or (len(group_indices) and
+                               (group_indices.min() < 0 or
+                                group_indices.max() >= num_groups)):
+            raise ValueError('group_indices must be within num_groups')
+        if not torch.isfinite(queries).all() or not torch.isfinite(points).all():
+            raise ValueError('queries and points must contain finite values')
         queries_fp32 = queries.float()
         center_offsets = self.center_offset_head(queries_fp32).float()
         center_votes = points.float() + center_offsets
@@ -305,14 +369,133 @@ class ReconstructionObjectHead(nn.Module):
         centers, sizes, observed = aggregate_point_set_boxes(
             points.float(), center_offsets, completion_logits,
             group_indices, num_groups)
+        boxes = _center_size_to_minmax(centers, sizes)
         return {
             'center_offsets': center_offsets,
             'center_votes': center_votes,
             'centers': centers,
             'sizes': sizes,
+            'boxes': boxes,
             'observed_half_sizes': observed,
+            'group_queries': _group_mean(
+                queries_fp32, group_indices, num_groups),
             'instance_embeddings': self.instance_projection(queries_fp32),
         }
+
+    @torch.no_grad()
+    def predict(self, samples: Dict[str, Tensor], group_indices: Tensor = None):
+        """Generate object boxes directly from reconstruction queries.
+
+        Training uses GT instance groups in :meth:`loss`; prediction uses
+        cross-view instance embedding affinity and never requires 3D labels.
+        """
+        required = {'queries', 'points', 'scene_indices', 'view_indices'}
+        missing = required - set(samples)
+        if missing:
+            raise KeyError(f'missing prediction samples: {sorted(missing)}')
+        queries = samples['queries']
+        points = samples['points']
+        scene_indices = samples['scene_indices']
+        view_indices = samples['view_indices']
+        if queries.ndim != 2 or points.shape != (len(queries), 3):
+            raise ValueError('queries and points must have shapes [M, D] and [M, 3]')
+        if not torch.isfinite(queries).all() or not torch.isfinite(points).all():
+            raise ValueError('queries and points must contain finite values')
+        if scene_indices.shape != (len(queries),) or view_indices.shape != (len(queries),):
+            raise ValueError('scene_indices and view_indices must have shape [M]')
+        if scene_indices.device != queries.device or view_indices.device != queries.device:
+            raise ValueError('scene_indices and view_indices must be on query device')
+        if not torch.isfinite(scene_indices.float()).all() or not torch.isfinite(view_indices.float()).all():
+            raise ValueError('scene_indices and view_indices must be finite')
+        scene_indices = scene_indices.long()
+        view_indices = view_indices.long()
+        if group_indices is not None:
+            if group_indices.shape != (len(queries),):
+                raise ValueError('group_indices must have shape [M]')
+            group_indices = group_indices.to(device=queries.device, dtype=torch.long)
+
+        embeddings = samples.get('instance_embeddings')
+        if embeddings is None:
+            embeddings = self.instance_projection(queries.float())
+        if embeddings.shape != (len(queries), self.instance_projection[-1].out_features):
+            raise ValueError('instance_embeddings must have shape [M, instance_dims]')
+        if embeddings.device != queries.device or not torch.isfinite(embeddings).all():
+            raise ValueError('instance_embeddings must be finite and on query device')
+        semantic_queries = samples.get('semantic_queries')
+        if semantic_queries is not None:
+            if semantic_queries.ndim != 2 or semantic_queries.shape[0] != len(queries):
+                raise ValueError('semantic_queries must have shape [M, C]')
+            if semantic_queries.device != queries.device or not torch.isfinite(semantic_queries).all():
+                raise ValueError('semantic_queries must be finite and on query device')
+        class_scores = samples.get('class_scores')
+        if class_scores is not None:
+            if class_scores.ndim != 2 or class_scores.shape[0] != len(queries):
+                raise ValueError('class_scores must have shape [M, C]')
+            if class_scores.device != queries.device or not torch.isfinite(class_scores).all():
+                raise ValueError('class_scores must be finite and on query device')
+        foreground = samples.get('foreground_scores')
+        if foreground is None:
+            foreground = (class_scores.amax(dim=-1)
+                          if class_scores is not None else
+                          points.new_ones(len(points)))
+        else:
+            if foreground.device != queries.device:
+                raise ValueError('foreground_scores must be finite and on query device')
+            foreground = foreground.to(dtype=torch.float32)
+        if foreground.shape != (len(queries),):
+            raise ValueError('foreground_scores must have shape [M]')
+        if foreground.device != queries.device or not torch.isfinite(foreground).all():
+            raise ValueError('foreground_scores must be finite and on query device')
+
+        outputs = []
+        for scene in torch.unique(scene_indices, sorted=True):
+            selected = scene_indices == scene
+            local_ids = torch.nonzero(selected, as_tuple=False).flatten()
+            if group_indices is None:
+                local_groups = group_instance_embeddings(
+                    embeddings[local_ids], scene_indices[local_ids],
+                    view_indices[local_ids], self.grouping_similarity_threshold)
+            else:
+                _, local_groups = torch.unique(
+                    group_indices[local_ids], sorted=True, return_inverse=True)
+            result = self(
+                queries[local_ids], points[local_ids], local_groups,
+                int(local_groups.max().item()) + 1)
+            if semantic_queries is None:
+                pooled_semantic = None
+            else:
+                pooled_semantic = _group_mean(
+                    semantic_queries[local_ids].float(), local_groups,
+                    result['boxes'].shape[0])
+            group_scores = []
+            group_labels = []
+            for group_id in range(result['boxes'].shape[0]):
+                members = local_groups == group_id
+                weights = foreground[local_ids][members].float().clamp_min(1e-6)
+                if class_scores is None:
+                    group_scores.append(weights.mean())
+                    group_labels.append(torch.tensor(
+                        -1, dtype=torch.long, device=queries.device))
+                else:
+                    scores = class_scores[local_ids][members].float()
+                    pooled = (scores * weights[:, None]).sum(0) / weights.sum()
+                    group_scores.append(pooled.max())
+                    group_labels.append(pooled.argmax())
+            outputs.append({
+                'boxes': result['boxes'],
+                'scores': torch.stack(group_scores),
+                'labels': torch.stack(group_labels),
+                'centers': result['centers'],
+                'sizes': result['sizes'],
+                'observed_half_sizes': result['observed_half_sizes'],
+                'instance_embeddings': result['instance_embeddings'],
+                'grouping_embeddings': embeddings[local_ids],
+                'group_queries': result['group_queries'],
+                'semantic_queries': pooled_semantic,
+                'group_indices': local_groups,
+                'query_indices': local_ids,
+            })
+        return outputs
 
     def loss(self, samples: Dict[str, Tensor]):
         queries = samples['queries']

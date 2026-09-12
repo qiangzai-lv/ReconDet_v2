@@ -4,6 +4,7 @@ from .multiview_pipeline import LoadFirstFramePose, MultiViewPipeline
 from .scannet_multiview_dataset import MultiViewScanNetDataset
 from .vggt_ground_truth import BuildVGGTGroundTruth
 from .recondet import ReconDet
+from .proposal_warmup_hook import ReconDetProposalWarmupHook
 from .recondet_head import ReconDetHead
 from .grounding_dino_head import ReconGroundingDINOHead
 
@@ -15,5 +16,6 @@ __all__ = [
     'LoadFirstFramePose', 'MultiViewPipeline', 'BuildVGGTGroundTruth',
     'PackNeRFDetInputs',
     'ReconDetDataPreprocessor', 'ReconDetHead', 'ReconGroundingDINO',
+    'ReconDetProposalWarmupHook',
     'ReconGroundingDINOHead',
 ]

@@ -30,6 +30,9 @@ _decoder_layer_num = 4
 _query_xyz_range_ = [-6.5, -9.0, -1.0, 6.5, 9.0, 4.5]
 model = dict(
     type='ReconDet',
+    proposal_grouping='embedding',
+    proposal_warmup_epochs=4,
+    proposal_capacity=128,
     vggt_omega_checkpoint=vggt_omega_checkpoint,
     vggt_lora_cfg=dict(
         enabled=True,
@@ -82,7 +85,8 @@ model = dict(
         center_weight=0.5,
         bbox_weight=1.0,
         giou_weight=0.5,
-        min_bbox_views=2),
+        min_bbox_views=2,
+        grouping_similarity_threshold=0.65),
     supervise_camera_head=True,
     prediction_visualization=False,
     prediction_visualization_dir='work_dirs/recondet_visualizations',
@@ -134,12 +138,12 @@ model = dict(
         if_v2_head=True,
         matcher='repeated_hungarian',
         initial_size_anchor=(1.0, 1.0, 1.0),
-        gt_repeat_num=5,
+        gt_repeat_num=1,
         center_range=_query_xyz_range_,
         size_logit_range=(-5.0, 5.0),
         loss_layer_ids=list(range(_decoder_layer_num))
     ),
-    num_queries=256,
+    num_queries=128,
     token_dim=_token_dim_,
     test_only_last_layer=True,
     if_mix_precision=True,
@@ -209,7 +213,7 @@ test_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
-        n_images=64,
+        n_images=128,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
@@ -227,7 +231,7 @@ train_dataloader = dict(
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
         type='RepeatDataset',
-        times=1,
+        times=6,
         dataset=dict(
             type=dataset_type,
             data_root=data_root,
@@ -283,7 +287,7 @@ test_evaluator = val_evaluator
 # train cfg
 _warm_epoch = 0
 _max_epoch = 200
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=1)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=2)
 test_cfg = dict()
 val_cfg = dict()
 
@@ -309,8 +313,10 @@ param_scheduler = [
 ]
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule='greater', interval=1, max_keep_ckpts=4),
+    checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule='greater', interval=2, max_keep_ckpts=4),
     logger=dict(type='LoggerHook', interval=10)
 )
+
+custom_hooks = [dict(type='ReconDetProposalWarmupHook')]
 
 find_unused_parameters = True

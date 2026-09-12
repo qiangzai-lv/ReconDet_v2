@@ -77,6 +77,9 @@ class ReconDet(Base3DDetector):
             prediction_visualization=False,
             prediction_visualization_dir='work_dirs/recondet_visualizations',
             prediction_visualization_score_thr=0.1,
+            proposal_grouping='embedding',
+            proposal_warmup_epochs=0,
+            proposal_capacity=None,
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -153,7 +156,18 @@ class ReconDet(Base3DDetector):
         self.test_cfg = test_cfg
 
         self.num_queries = num_queries
+        if proposal_grouping not in ('embedding', 'gt'):
+            raise ValueError("proposal_grouping must be 'embedding' or 'gt'")
+        if proposal_warmup_epochs < 0:
+            raise ValueError('proposal_warmup_epochs must be non-negative')
+        self.proposal_grouping = proposal_grouping
+        self.proposal_warmup_epochs = int(proposal_warmup_epochs)
+        self.proposal_epoch = 0
+        self.proposal_capacity = int(proposal_capacity or num_queries)
+        if self.proposal_capacity <= 0:
+            raise ValueError('proposal_capacity must be positive')
         query_clustering_cfg = dict(query_clustering_cfg or {})
+        self.query_clustering_cfg = dict(query_clustering_cfg)
         self.scene_query_clustering = SemanticWeightedFPSClustering(
             num_clusters=num_queries, **query_clustering_cfg)
         self.test_only_last_layer = test_only_last_layer
@@ -333,7 +347,7 @@ class ReconDet(Base3DDetector):
             batch_size=batch_size,
             num_views=num_views,
             score_threshold=self.reconstruction_query_score_thr,
-            min_queries=self.num_queries)
+            min_queries=self.proposal_capacity)
 
     def _compute_reconstruction_object_losses(
             self, reconstruction_outputs, batch_data_samples, num_views):
@@ -345,6 +359,13 @@ class ReconDet(Base3DDetector):
             reconstruction_outputs, matches, batch_data_samples, num_views)
         losses, _ = self.reconstruction_object_head.loss(samples)
         return losses
+
+    def set_proposal_epoch(self, epoch):
+        self.proposal_epoch = max(int(epoch), 0)
+
+    def _use_gt_proposal_grouping(self):
+        return (self.training and self.proposal_grouping == 'gt') or (
+            self.training and self.proposal_epoch < self.proposal_warmup_epochs)
 
     def _fuse_detection_queries(self, reconstruction_query,
                                 semantic_query_2d):
@@ -389,6 +410,123 @@ class ReconDet(Base3DDetector):
         if return_diagnostics:
             return (cluster_xyz, cluster_size, detection_query, diagnostics)
         return cluster_xyz, cluster_size, detection_query
+
+    def _build_object_proposals(self, selected_scenes, batch_data_samples=None,
+                                reconstruction_matches=None, num_views=None):
+        """Build fixed-size direct object proposals plus legacy fillers."""
+        proposal_batches = []
+        for batch_index, scene in enumerate(selected_scenes):
+            samples = {
+                'queries': scene['reconstruction_query'],
+                'points': scene['points_aligned'],
+                'scene_indices': torch.zeros(
+                    len(scene['reconstruction_query']), dtype=torch.long,
+                    device=scene['reconstruction_query'].device),
+                'view_indices': scene['source_view_id'].long(),
+                'instance_embeddings': scene['instance_embeddings_2d'],
+                'semantic_queries': scene['detection_query_2d'],
+                'class_scores': scene['class_scores_2d'],
+                'foreground_scores': scene['foreground_score'],
+            }
+            gt_group_indices = None
+            if (self._use_gt_proposal_grouping()
+                    and batch_data_samples is not None
+                    and reconstruction_matches is not None
+                    and num_views is not None):
+                group_keys = []
+                for candidate_index, (view_id, query_id) in enumerate(zip(
+                        scene['source_view_id'].tolist(),
+                        scene['source_query_id'].tolist())):
+                    flat_view = batch_index * num_views + int(view_id)
+                    query_indices, gt_indices = reconstruction_matches[flat_view]
+                    matches = torch.nonzero(
+                        query_indices.to(
+                            device=scene['reconstruction_query'].device,
+                            dtype=torch.long) == query_id,
+                        as_tuple=False).flatten()
+                    if len(matches) == 0:
+                        group_keys.append(-(candidate_index + 1))
+                    else:
+                        if len(matches) > 1:
+                            raise ValueError(
+                                'reconstruction_matches contains duplicate '
+                                f'query index {query_id} for view {flat_view}')
+                        gt_index = int(gt_indices[matches[0]].item())
+                        instance_ids = batch_data_samples[batch_index].gt_instances_2d[
+                            int(view_id)].instance_ids_3d
+                        if gt_index < 0 or gt_index >= len(instance_ids):
+                            raise ValueError(
+                                'reconstruction_matches contains an out-of-range '
+                                f'GT index {gt_index} for view {flat_view}')
+                        group_keys.append(int(instance_ids[gt_index]))
+                gt_group_indices = torch.as_tensor(
+                    group_keys, device=scene['reconstruction_query'].device,
+                    dtype=torch.long)
+            real = self.reconstruction_object_head.predict(
+                samples, group_indices=gt_group_indices)[0]
+            real_count = min(self.proposal_capacity, real['boxes'].shape[0])
+            real_ids = torch.argsort(real['scores'], descending=True)[:real_count]
+            centers = real['centers'][real_ids]
+            sizes = real['sizes'][real_ids]
+            queries = real['group_queries'][real_ids]
+            semantic = real['semantic_queries']
+            if semantic is None:
+                semantic = queries.new_zeros((len(queries), self.semantic_encoder.model.embed_dims))
+            else:
+                semantic = semantic[real_ids]
+            remaining_mask = torch.ones(
+                len(scene['reconstruction_query']), dtype=torch.bool,
+                device=centers.device)
+            used = real['query_indices'][torch.isin(
+                real['group_indices'], real_ids)]
+            remaining_mask[used] = False
+            fill_count = self.proposal_capacity - real_count
+            filler = None
+            if fill_count > 0 and remaining_mask.any():
+                filler_source = {
+                    key: value[remaining_mask]
+                    for key, value in (
+                        ('points_aligned', scene['points_aligned']),
+                        ('reconstruction_query', scene['reconstruction_query']),
+                        ('detection_query_2d', scene['detection_query_2d']),
+                        ('class_scores_2d', scene['class_scores_2d']),
+                        ('foreground_score', scene['foreground_score']))}
+                clusterer = SemanticWeightedFPSClustering(
+                    num_clusters=fill_count, **self.query_clustering_cfg)
+                filler = clusterer(
+                    filler_source['points_aligned'][None],
+                    filler_source['reconstruction_query'][None],
+                    filler_source['detection_query_2d'][None],
+                    filler_source['class_scores_2d'][None],
+                    filler_source['foreground_score'][None])
+                filler = tuple(value[0] for value in filler)
+            if fill_count > 0:
+                if filler is None:
+                    filler = (centers.new_zeros((0, 3)),
+                              queries.new_zeros((0, 3)),
+                              queries.new_zeros((0, queries.shape[-1])),
+                              semantic.new_zeros((0, semantic.shape[-1])))
+                filler_centers, _, filler_queries, filler_semantic = filler
+                filler_count = filler_centers.shape[0]
+                filler_sizes = centers.new_ones((filler_count, 3))
+                filler_queries = self._fuse_detection_queries(
+                    filler_queries, filler_semantic)
+                centers = torch.cat([centers, filler_centers], dim=0)
+                sizes = torch.cat([sizes, filler_sizes], dim=0)
+                queries = torch.cat([self._fuse_detection_queries(
+                    queries, semantic), filler_queries], dim=0)
+                if centers.shape[0] < self.proposal_capacity:
+                    pad = self.proposal_capacity - centers.shape[0]
+                    if centers.shape[0] == 0:
+                        raise RuntimeError('proposal packing produced no centers')
+                    ids = torch.arange(pad, device=centers.device) % centers.shape[0]
+                    centers = torch.cat([centers, centers[ids]], dim=0)
+                    sizes = torch.cat([sizes, centers.new_ones((pad, 3))], dim=0)
+                    queries = torch.cat([queries, queries[ids]], dim=0)
+            else:
+                queries = self._fuse_detection_queries(queries, semantic)
+            proposal_batches.append((centers, sizes, queries))
+        return tuple(torch.stack(values).detach() for values in zip(*proposal_batches))
 
     def get_box_features(self, feature_maps, batch_inputs_dict, images,
                          query_xyz, query, extrinsics, intrinsics):
@@ -452,8 +590,10 @@ class ReconDet(Base3DDetector):
                        for name, value in object_losses.items()})
         selected_reconstruction = self._select_reconstruction_queries(
             reconstruction_outputs, img)
-        query_xyz, _, query = (
-            self._cluster_reconstruction_queries(selected_reconstruction))
+        query_xyz, query_sizes, query = self._build_object_proposals(
+            selected_reconstruction, batch_data_samples,
+            reconstruction_outputs.get('reconstruction_matches'),
+            img.shape[1])
         box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz, query,
             extrinsics, intrinsics)
@@ -462,6 +602,7 @@ class ReconDet(Base3DDetector):
             batch_data_samples,
             batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
+            initial_sizes=query_sizes,
             **kwargs)
         losses.update({f'recondet_{name}': value
                        for name, value in detection_losses.items()})
@@ -486,9 +627,8 @@ class ReconDet(Base3DDetector):
             reconstruction_outputs, batch_inputs_dict, img)
         selected_reconstruction = self._select_reconstruction_queries(
             reconstruction_outputs, img)
-        (query_xyz, _, query, cluster_diagnostics) = (
-            self._cluster_reconstruction_queries(
-                selected_reconstruction, return_diagnostics=True))
+        query_xyz, query_sizes, query = self._build_object_proposals(
+            selected_reconstruction)
         box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz, query,
             extrinsics, intrinsics)
@@ -497,11 +637,12 @@ class ReconDet(Base3DDetector):
             batch_data_samples,
             batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
+            initial_sizes=query_sizes,
             **kwargs)
         if self.prediction_visualization:
             self._save_prediction_visualizations(
                 batch_data_samples, results_list, reconstruction_outputs,
-                num_views=img.shape[1], cluster_diagnostics=cluster_diagnostics)
+                num_views=img.shape[1], cluster_diagnostics=None)
         predictions = self.add_pred_to_datasample(batch_data_samples,
                                                   results_list)
         return predictions
@@ -564,12 +705,13 @@ class ReconDet(Base3DDetector):
             reconstruction_outputs, batch_inputs_dict, img)
         selected_reconstruction = self._select_reconstruction_queries(
             reconstruction_outputs, img)
-        query_xyz, _, query = (
-            self._cluster_reconstruction_queries(selected_reconstruction))
+        query_xyz, query_sizes, query = self._build_object_proposals(
+            selected_reconstruction)
         box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz, query,
             extrinsics, intrinsics)
 
         results = self.bbox_head.forward(
-            box_features, batch_inputs_dict, refined_query_xyz)
+            box_features, batch_inputs_dict, refined_query_xyz,
+            initial_sizes=query_sizes)
         return results

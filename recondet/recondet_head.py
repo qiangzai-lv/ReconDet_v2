@@ -25,18 +25,26 @@ def decode_size_residuals(size_residuals, initial_size_anchor,
     """Decode detached, multiplicative size refinement across layers."""
     if not size_residuals:
         return [], [], []
-    if len(initial_size_anchor) != 3:
-        raise ValueError('initial_size_anchor must contain three values')
     if (len(size_logit_range) != 2
             or size_logit_range[0] >= size_logit_range[1]):
         raise ValueError('size_logit_range must be an increasing pair')
 
     first = size_residuals[0]
-    anchor = torch.as_tensor(
-        initial_size_anchor, device=first.device, dtype=first.dtype)
+    if isinstance(initial_size_anchor, Tensor):
+        if initial_size_anchor.shape != (first.shape[0], first.shape[2], 3):
+            raise ValueError(
+                'initial_size_anchor tensor must have shape [B, Q, 3]')
+        anchor = initial_size_anchor.to(
+            device=first.device, dtype=first.dtype).permute(0, 2, 1)
+    else:
+        if len(initial_size_anchor) != 3:
+            raise ValueError('initial_size_anchor must contain three values')
+        anchor = torch.as_tensor(
+            initial_size_anchor, device=first.device, dtype=first.dtype
+        ).view(1, 3, 1).expand_as(first)
     if not torch.isfinite(anchor).all() or (anchor <= 0).any():
         raise ValueError('initial_size_anchor must be finite and positive')
-    reference_log = anchor.log().view(1, 3, 1).expand_as(first)
+    reference_log = anchor.log()
 
     reference_logs = []
     predicted_logs = []
@@ -190,7 +198,7 @@ class ReconDetHead(BaseModule):
             nn.init.constant_(semcls_head.layers[-1].bias, prior_bias)
 
     def forward(self, x, batch_inputs_dict, refined_query_xyz=None,
-                layer_ids=None):
+                layer_ids=None, initial_sizes=None):
         if layer_ids is None:
             layer_ids = list(range(len(x)))
         if len(layer_ids) != len(x):
@@ -209,12 +217,16 @@ class ReconDetHead(BaseModule):
             center_preds.append(center.permute(0, 2, 1))
             size_residual_preds.append(self.size_heads[layer_id](feature))
             cls_preds.append(self.semcls_heads[layer_id](feature))
+        if initial_sizes is None:
+            size_anchor = self.initial_size_anchor
+        else:
+            size_anchor = initial_sizes
         with torch.autocast(device_type=size_residual_preds[0].device.type,
                             enabled=False):
             size_reference_logs, size_log_preds, size_preds = (
                 decode_size_residuals(
                     [residual.float() for residual in size_residual_preds],
-                    self.initial_size_anchor,
+                    size_anchor,
                     self.size_logit_range))
         return dict(
             center_preds=center_preds,
@@ -225,11 +237,13 @@ class ReconDetHead(BaseModule):
             cls_preds=cls_preds)
 
     def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
-             batch_inputs_dict: dict, refined_query_xyz=None, **kwargs) -> dict:
+             batch_inputs_dict: dict, refined_query_xyz=None,
+             initial_sizes=None, **kwargs) -> dict:
         if refined_query_xyz is None or len(refined_query_xyz) != len(x):
             raise ValueError('Loss requires one refined reference per layer')
         layer_ids = self.loss_layer_ids
-        outputs = self(x, batch_inputs_dict, refined_query_xyz)
+        outputs = self(x, batch_inputs_dict, refined_query_xyz,
+                       initial_sizes=initial_sizes)
 
         if 'points' in batch_inputs_dict.keys():
             batch_input_points = batch_inputs_dict['points']
@@ -398,13 +412,14 @@ class ReconDetHead(BaseModule):
     def predict(self,
                 x: Tuple[Tensor],
                 batch_data_samples: SampleList, batch_inputs_dict,
-                refined_query_xyz=None, layer_ids=None,
+                refined_query_xyz=None, layer_ids=None, initial_sizes=None,
                 rescale: bool = False) -> InstanceList:
 
         batch_input_metas = [
             data_samples.metainfo for data_samples in batch_data_samples
         ]
-        outputs = self(x, batch_inputs_dict, refined_query_xyz, layer_ids)
+        outputs = self(x, batch_inputs_dict, refined_query_xyz, layer_ids,
+                       initial_sizes=initial_sizes)
         predictions = self.predict_by_feat(
             [outputs['center_preds'][-1]],
             [outputs['size_preds'][-1]],

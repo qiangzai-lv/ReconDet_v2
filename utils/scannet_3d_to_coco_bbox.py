@@ -36,12 +36,14 @@ class GeneratorConfig:
     rel_depth_tolerance: float = 0.01
     depth_window_radius: int = 1
     min_visible_points: int = 3
-    min_visible_ratio: float = 0.2
+    min_visible_ratio: float = 0.0
+    box_surface_tolerance: float = 0.02
     bbox_padding: float = 2.0
     center_min_samples: int = 3
     center_window_fraction: float = 0.1
     center_window_min_size: int = 2
     center_window_max_size: int = 6
+    include_amodal_bbox: bool = False
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,7 @@ class ViewGeometry:
 @dataclass(frozen=True)
 class VisualizationItem:
     bbox_xywh: Sequence[float]
+    amodal_bbox_xywh: Optional[Sequence[float]]
     category_name: str
     instance_id: int
     visible_point_ratio: float
@@ -146,11 +149,12 @@ def resize_intrinsic(intrinsic: np.ndarray, source_size: Tuple[int, int],
     return scaled
 
 
-def load_depth_map(root: Path, image_path: Path, depth_scale: float = 1000.0) -> np.ndarray:
-    """Load the matching ScanNet depth PNG and convert its units to metres."""
+def load_depth_map(root: Path, image_path: Path, depth_scale: float = 1000.0,
+                   depth_path: Optional[Path] = None) -> np.ndarray:
+    """Load an ARKit depth PNG and convert its units to metres."""
     if depth_scale <= 0 or not np.isfinite(depth_scale):
         raise ValueError('depth_scale must be finite and positive')
-    depth_path = root / image_path.parent / 'depth' / f'{image_path.stem}.png'
+    depth_path = depth_path or (root / image_path.parent / 'depth' / f'{image_path.stem}.png')
     if not depth_path.is_file():
         raise FileNotFoundError(f'matching depth map not found: {depth_path}')
     with Image.open(depth_path) as depth_image:
@@ -209,7 +213,11 @@ def _aabb_corners(box: np.ndarray) -> np.ndarray:
         [-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
         [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1],
     ], dtype=np.float32)
-    return center + signs * half_size
+    local = signs * half_size
+    yaw = float(box[6])
+    c, sn = np.cos(yaw), np.sin(yaw)
+    rotation = np.array([[c, -sn, 0], [sn, c, 0], [0, 0, 1]])
+    return center + local @ rotation.T
 
 
 _AABB_EDGES = tuple(
@@ -299,18 +307,26 @@ def classify_depth_visibility(
     return result
 
 
-def assign_scene_points(points: np.ndarray, boxes: np.ndarray) -> PointAssignments:
+def assign_scene_points(points: np.ndarray, boxes: np.ndarray,
+                        surface_tolerance: float = 0.02) -> PointAssignments:
     points = np.asarray(points, dtype=np.float32)
     boxes = np.asarray(boxes, dtype=np.float32)
     if boxes.size == 0:
         return PointAssignments(
             np.zeros((len(points), 0), dtype=bool),
             np.full(len(points), -1, dtype=np.int32))
-    lower = boxes[:, :3] - boxes[:, 3:6] / 2.0
-    upper = boxes[:, :3] + boxes[:, 3:6] / 2.0
+    if boxes.ndim != 2 or boxes.shape[1] != 7:
+        raise ValueError('ARKit boxes must have shape [N, 7]')
+    if not np.isfinite(surface_tolerance) or surface_tolerance < 0:
+        raise ValueError('surface_tolerance must be finite and nonnegative')
+    delta = points[:, None, :] - boxes[None, :, :3]
+    c, sn = np.cos(boxes[:, 6]), np.sin(boxes[:, 6])
+    local = delta.copy()
+    local[..., 0] = delta[..., 0] * c + delta[..., 1] * sn
+    local[..., 1] = -delta[..., 0] * sn + delta[..., 1] * c
     membership = np.all(
-        (points[:, None, :] >= lower[None])
-        & (points[:, None, :] <= upper[None]), axis=2)
+        np.abs(local) <= boxes[None, :, 3:6] / 2 + surface_tolerance,
+        axis=2)
     counts = membership.sum(axis=1)
     owner = np.full(len(points), -1, dtype=np.int32)
     unique = counts == 1
@@ -354,12 +370,24 @@ def sample_view_indices(
 
 
 def _resolve_point_path(root: Path, relative: Path) -> Path:
-    candidates = (relative, root / relative, root / 'points' / relative.name)
+    candidates = (relative, root / relative, root / 'train_points' / relative.name,
+                  root / 'val_points' / relative.name, root / 'points' / relative.name)
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(
         'point cloud not found; checked: ' + ', '.join(map(str, candidates)))
+
+def _resolve_arkit_path(root: Path, relative: Path) -> Path:
+    """Resolve paths stored with the archive's ``processed/3dod`` prefix."""
+    candidates = [relative, root / relative]
+    parts = relative.parts
+    if len(parts) >= 3 and parts[0] == 'processed' and parts[1] == '3dod':
+        candidates.append(root / parts[2] / Path(*parts[3:]))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError('ARKit file not found; checked: ' + ', '.join(map(str, candidates)))
 
 
 def load_axis_aligned_scene_points(root: Path, info: dict) -> np.ndarray:
@@ -416,13 +444,14 @@ def _is_truncated(box: np.ndarray, width: int, height: int) -> bool:
 
 def _prepare_objects(
         info: dict, points: np.ndarray,
-        category_by_label: Dict[int, str]) -> Tuple[list, PointAssignments]:
+        category_by_label: Dict[int, str],
+        surface_tolerance: float = 0.02) -> Tuple[list, PointAssignments]:
     instances = info.get('instances', [])
     boxes = np.asarray(
-        [instance['bbox_3d'][:6] for instance in instances], dtype=np.float32)
+        [instance['bbox_3d'] for instance in instances], dtype=np.float32)
     if not len(instances):
-        boxes = np.empty((0, 6), dtype=np.float32)
-    assignments = assign_scene_points(points, boxes)
+        boxes = np.empty((0, 7), dtype=np.float32)
+    assignments = assign_scene_points(points, boxes, surface_tolerance)
     objects = []
     seen_instance_ids = set()
     for list_index, instance in enumerate(instances):
@@ -577,45 +606,48 @@ def _infer_object(
         obj: SceneObject, points: np.ndarray, geometry: ViewGeometry,
         world_to_camera: np.ndarray, intrinsic: np.ndarray,
         width: int, height: int, config: GeneratorConfig) -> InstanceResult:
-    amodal = project_aabb(obj.box, world_to_camera, intrinsic, width, height)
-    if amodal is None:
+    amodal = (project_aabb(obj.box, world_to_camera, intrinsic, width, height)
+              if config.include_amodal_bbox else None)
+    amodal_clip = (amodal if amodal is not None else
+                   np.asarray([0., 0., float(width), float(height)], dtype=np.float32))
+    if config.include_amodal_bbox and amodal is None:
         return InstanceResult(
             obj.instance_id, obj.label + 1, obj.category_name, None, None,
             0, 0.0, False, 'outside_camera_frustum')
     if not len(obj.point_indices):
         return InstanceResult(
             obj.instance_id, obj.label + 1, obj.category_name, None,
-            _xyxy_to_xywh(amodal), 0, 0.0,
-            _is_truncated(amodal, width, height), 'aabb_contains_no_points')
+            _xyxy_to_xywh(amodal_clip), 0, 0.0,
+            _is_truncated(amodal_clip, width, height), 'aabb_contains_no_points')
 
     indices = obj.point_indices
     visible = ((geometry.visibility[indices] == VISIBLE)
                & geometry.in_image[indices])
     visible_count = int(visible.sum())
     visible_ratio = visible_count / len(indices)
-    if visible_ratio <= config.min_visible_ratio:
+    if config.min_visible_ratio > 0 and visible_ratio < config.min_visible_ratio:
         return InstanceResult(
             obj.instance_id, obj.label + 1, obj.category_name, None,
-            _xyxy_to_xywh(amodal), visible_count, visible_ratio,
-            _is_truncated(amodal, width, height), 'mostly_occluded')
+            _xyxy_to_xywh(amodal_clip), visible_count, visible_ratio,
+            _is_truncated(amodal_clip, width, height), 'mostly_occluded')
     if visible_count < config.min_visible_points:
         return InstanceResult(
             obj.instance_id, obj.label + 1, obj.category_name, None,
-            _xyxy_to_xywh(amodal), visible_count, visible_ratio,
-            _is_truncated(amodal, width, height), 'too_few_visible_points')
+            _xyxy_to_xywh(amodal_clip), visible_count, visible_ratio,
+            _is_truncated(amodal_clip, width, height), 'too_few_visible_points')
 
     exclusive_visible = visible & obj.exclusive
     bbox_points = geometry.pixels[indices][exclusive_visible]
     if len(bbox_points) < config.min_visible_points:
         bbox_points = geometry.pixels[indices][visible]
     bbox = visible_points_bbox(
-        bbox_points, amodal, width, height,
+        bbox_points, amodal_clip, width, height,
         padding=config.bbox_padding)
     if bbox is None:
         return InstanceResult(
             obj.instance_id, obj.label + 1, obj.category_name, None,
             _xyxy_to_xywh(amodal), visible_count, visible_ratio,
-            _is_truncated(amodal, width, height), 'invalid_visible_bbox')
+            _is_truncated(amodal_clip, width, height), 'invalid_visible_bbox')
     center_depth, center_3d, center_sample_count, center_source = (
         _estimate_center_geometry(
             obj, points, geometry, bbox, world_to_camera, width, height,
@@ -623,7 +655,7 @@ def _infer_object(
     return InstanceResult(
         obj.instance_id, obj.label + 1, obj.category_name, bbox,
         _xyxy_to_xywh(amodal), visible_count, visible_ratio,
-        _is_truncated(amodal, width, height),
+        _is_truncated(amodal_clip, width, height),
         None if bbox is not None else 'invalid_visible_bbox',
         center_depth, center_3d, center_sample_count, center_source)
 
@@ -633,13 +665,23 @@ def _process_view(
         objects: Iterable[SceneObject], view_index: int, image_id: int,
         config: GeneratorConfig) -> ViewResult:
     relative = Path(info['img_paths'][view_index])
-    image_path = relative if relative.is_absolute() else root / relative
+    image_path = relative if relative.is_absolute() else _resolve_arkit_path(root, relative)
     with Image.open(image_path) as image:
         width, height = image.size
-    depth_map = load_depth_map(root, relative, config.depth_scale)
-    world_to_camera = world_to_camera_from_aligned_pose(
-        np.asarray(info['axis_align_matrix'], dtype=np.float32),
-        np.asarray(info['lidar2cam'][view_index], dtype=np.float32))
+    depth_relative = info.get('depth_paths', [None] * len(info['img_paths']))[view_index]
+    depth_path = None if depth_relative is None else Path(depth_relative)
+    if depth_path is not None and not depth_path.is_absolute():
+        depth_path = _resolve_arkit_path(root, depth_path)
+    depth_map = load_depth_map(root, relative, config.depth_scale, depth_path)
+    # ARKit stores each pose as camera-to-world.  The processed point cloud
+    # and 3D annotations are in the same scene/world frame, so invert exactly
+    # once to obtain the view's world-to-camera transform.
+    pose_path = image_path.with_name(image_path.name.replace('_color.png', '_pose.npy'))
+    if pose_path.is_file():
+        camera_to_world = np.load(pose_path).astype(np.float32)
+    else:
+        camera_to_world = np.asarray(info['lidar2cam'][view_index], dtype=np.float32)
+    world_to_camera = np.linalg.inv(camera_to_world).astype(np.float32)
     intrinsic = camera_matrix_for_view(info['cam2img'], view_index)
     geometry = _build_view_geometry(
         points, world_to_camera, intrinsic, width, height, depth_map, config)
@@ -663,6 +705,12 @@ def render_annotation_image(
         x, y, box_width, box_height = map(float, item.bbox_xywh)
         x2 = min(float(width - 1), x + box_width)
         y2 = min(float(height - 1), y + box_height)
+        if item.amodal_bbox_xywh is not None:
+            ax, ay, aw, ah = map(float, item.amodal_bbox_xywh)
+            ax2 = min(float(width - 1), ax + aw)
+            ay2 = min(float(height - 1), ay + ah)
+            if ax2 >= ax and ay2 >= ay:
+                draw.rectangle((ax, ay, ax2, ay2), outline=(160, 160, 160), width=3)
         draw.rectangle((x, y, x2, y2), outline=color, width=3)
         label = (f'{item.category_name} #{item.instance_id} '
                  f'visible={item.visible_point_ratio:.2f}')
@@ -682,12 +730,13 @@ def _save_view_visualization(
         root: Path, visualization_root: Path, scene_id: str,
         view: ViewResult) -> Path:
     relative = Path(view.file_name)
-    image_path = relative if relative.is_absolute() else root / relative
+    image_path = relative if relative.is_absolute() else _resolve_arkit_path(root, relative)
     with Image.open(image_path) as source_image:
         image = source_image.convert('RGB')
     items = [
         VisualizationItem(
-            result.bbox, result.category_name, result.instance_id,
+            result.bbox, result.amodal_bbox, result.category_name,
+            result.instance_id,
             result.visible_point_ratio, result.category_id)
         for result in view.results.values() if result.bbox is not None
     ]
@@ -770,11 +819,13 @@ def convert(args: argparse.Namespace) -> None:
         depth_window_radius=args.depth_window_radius,
         min_visible_points=args.min_visible_points,
         min_visible_ratio=args.min_visible_ratio,
+        box_surface_tolerance=args.box_surface_tolerance,
         bbox_padding=args.bbox_padding,
         center_min_samples=args.center_min_samples,
         center_window_fraction=args.center_window_fraction,
         center_window_min_size=args.center_window_min_size,
-        center_window_max_size=args.center_window_max_size)
+        center_window_max_size=args.center_window_max_size,
+        include_amodal_bbox=args.include_amodal_bbox)
     visualization_root = None
     if args.visualize:
         visualization_root = Path(args.visualization_dir).resolve() \
@@ -806,7 +857,7 @@ def convert(args: argparse.Namespace) -> None:
         rejections = []
         image_id = annotation_id = 1
         points = load_axis_aligned_scene_points(root, info)
-        objects, _ = _prepare_objects(info, points, category_by_label)
+        objects, _ = _prepare_objects(info, points, category_by_label, config.box_surface_tolerance)
         rng = np.random.default_rng(args.seed + scene_index)
         view_indices = sample_view_indices(
             len(info['img_paths']), args.num_views, args.sampling, rng)
@@ -836,7 +887,8 @@ def convert(args: argparse.Namespace) -> None:
                     result.bbox, annotation_id, image_id,
                     result.category_id, result.instance_id, {
                         'scene_id': scene_id,
-                        'bbox_amodal': result.amodal_bbox,
+                        **({'bbox_amodal': result.amodal_bbox}
+                           if args.include_amodal_bbox else {}),
                         'visible_point_count': result.visible_point_count,
                         'visible_point_ratio': result.visible_point_ratio,
                         'truncated': result.truncated,
@@ -899,13 +951,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--depth-window-radius', type=int, default=1)
     parser.add_argument('--min-visible-points', type=int, default=3)
     parser.add_argument(
-        '--min-visible-ratio', type=float, default=0.2,
+        '--min-visible-ratio', type=float, default=0.0,
         help='Reject an instance when less than this fraction of its 3D points is visible.')
+    parser.add_argument('--box-surface-tolerance', type=float, default=0.02)
     parser.add_argument('--center-min-samples', type=int, default=3)
     parser.add_argument('--center-window-fraction', type=float, default=0.1)
     parser.add_argument('--center-window-min-size', type=int, default=2)
     parser.add_argument('--center-window-max-size', type=int, default=6)
     parser.add_argument('--bbox-padding', type=float, default=2.0)
+    parser.add_argument('--include-amodal-bbox', action='store_true')
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument('--visualization-dir')
     parser.add_argument('--visualization-max-images', type=int, default=-1)

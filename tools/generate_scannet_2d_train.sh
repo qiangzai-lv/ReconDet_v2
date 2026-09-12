@@ -31,7 +31,7 @@ exec "${PYTHON_BIN}" utils/scannet_3d_to_coco_bbox.py \
   --depth-scale 1000 \
   --depth-window-radius 1 \
   --min-visible-points 3 \
-  --min-visible-ratio 0.2 \
+  --min-visible-ratio 0.0 \
   --bbox-padding 2 \
   --center-min-samples 3 \
   --center-window-fraction 0.1 \

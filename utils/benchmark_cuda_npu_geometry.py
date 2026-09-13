@@ -271,17 +271,28 @@ def _npu_bev_iou(torch, mx_driving, pred, gt):
 
 def _npu_pairwise(torch, mx_driving, pred, gt):
     bev_iou = _npu_bev_iou(torch, mx_driving, pred, gt)
-    pred_z_min = pred[..., 2, None] - pred[..., 5, None] / 2
-    pred_z_max = pred[..., 2, None] + pred[..., 5, None] / 2
-    gt_z_min = gt[..., None, 2] - gt[..., None, 5] / 2
-    gt_z_max = gt[..., None, 2] + gt[..., None, 5] / 2
+    batch, num_pred, num_gt = pred.shape[0], pred.shape[1], gt.shape[1]
+    # DrivingSDK runs on NPU and its minimum/maximum kernels do not reliably
+    # broadcast [B,N,1] with [B,1,M]. Materialize the pairwise shape.
+    pred_z_min = (pred[..., 2] - pred[..., 5] / 2).unsqueeze(-1).expand(
+        -1, -1, num_gt).contiguous()
+    pred_z_max = (pred[..., 2] + pred[..., 5] / 2).unsqueeze(-1).expand(
+        -1, -1, num_gt).contiguous()
+    gt_z_min = (gt[..., 2] - gt[..., 5] / 2).unsqueeze(-2).expand(
+        -1, num_pred, -1).contiguous()
+    gt_z_max = (gt[..., 2] + gt[..., 5] / 2).unsqueeze(-2).expand(
+        -1, num_pred, -1).contiguous()
     overlap = (torch.minimum(pred_z_max, gt_z_max)
                - torch.maximum(pred_z_min, gt_z_min)).clamp_min(0)
-    inter_bev = bev_iou * pred[..., 3, None] * pred[..., 4, None]
+    pred_area = (pred[..., 3] * pred[..., 4]).unsqueeze(-1).expand(
+        -1, -1, num_gt).contiguous()
+    gt_volume = (gt[..., 3] * gt[..., 4] * gt[..., 5]).unsqueeze(-2).expand(
+        -1, num_pred, -1).contiguous()
+    pred_volume = (pred[..., 3] * pred[..., 4] * pred[..., 5]).unsqueeze(
+        -1).expand(-1, -1, num_gt).contiguous()
+    inter_bev = bev_iou * pred_area
     intersection = inter_bev * overlap
-    volume_pred = pred[..., 3, None] * pred[..., 4, None] * pred[..., 5, None]
-    volume_gt = gt[..., None, 3] * gt[..., None, 4] * gt[..., None, 5]
-    return intersection / (volume_pred + volume_gt - intersection).clamp_min(1e-8)
+    return intersection / (pred_volume + gt_volume - intersection).clamp_min(1e-8)
 
 
 def _cuda_matched(torch, pred, gt):

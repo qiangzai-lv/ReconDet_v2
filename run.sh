@@ -35,3 +35,19 @@ print('torch=', torch.__version__); \
 print('torch_npu=', getattr(torch_npu, '__version__', 'unknown')); \
 print('mx_driving=', mx_driving.__file__)"
 
+/root/miniconda3/envs/mmdet/bin/python \
+  utils/benchmark_cuda_npu_geometry.py \
+  --device npu \
+  --warmup 1 \
+  --repeats 1 \
+  --output fresh_npu_geometry.json
+
+
+/root/miniconda3/envs/mmdet/bin/python \
+  utils/benchmark_cuda_npu_geometry.py \
+  --device npu \
+  --warmup 1 \
+  --repeats 1 \
+  --output fresh_npu_geometry.json
+
+echo $?

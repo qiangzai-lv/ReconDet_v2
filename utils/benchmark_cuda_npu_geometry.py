@@ -381,6 +381,10 @@ def run_benchmark(device_name: str, warmup: int, repeats: int) -> Dict[str, obje
         importlib.import_module('torch_npu')
         if not torch.npu.is_available():
             raise RuntimeError('NPU is unavailable')
+        # Match the production import order. MMCV/mmdet3d may load CANN
+        # operator libraries before mx_driving; an isolated mx_driving import
+        # can otherwise hide an in-process libopapi.so conflict.
+        importlib.import_module('recondet.recondet_head')
         device = torch.device('npu')
         mx_driving = importlib.import_module('mx_driving')
     else:
@@ -493,7 +497,10 @@ def main(argv: List[str] = None) -> int:
         print(text)
     else:
         print(text)
-    if args.strict and payload.get('status') != 'ok':
+    # A real device benchmark must fail at the shell level when an operator
+    # raises. Previously the exception was serialized but the process exited
+    # zero unless --strict was supplied, hiding broken NPU runs in scripts.
+    if payload.get('status') != 'ok' and (args.device or args.strict):
         return 1
     return 0
 

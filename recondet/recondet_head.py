@@ -6,7 +6,7 @@ from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
-from mmcv.ops import diff_iou_rotated_3d, nms3d
+from mmcv.ops import nms3d
 from mmengine.model import BaseModule
 from mmengine.structures import InstanceData
 from torch import Tensor, nn
@@ -443,15 +443,15 @@ class ReconDetHead(BaseModule):
             yaw_loss = periodic_yaw_loss(
                 matched_yaw_vectors, matched_gt_yaws,
                 reduction='sum') / avg_factor
-            pred_boxes = torch.cat((
-                centers[pred_indices], sizes[pred_indices],
-                decode_yaw(matched_yaw_vectors)[:, None]), dim=-1)
-            gt_boxes = torch.cat((
-                gt_centers[gt_indices], gt_sizes[gt_indices],
-                matched_gt_yaws[:, None]), dim=-1)
-            iou = diff_iou_rotated_3d(
-                pred_boxes.unsqueeze(0), gt_boxes.unsqueeze(0)).squeeze(0)
-            iou_loss = (1.0 - iou).sum() / avg_factor
+            pred_tp_bbox = self._center_size_pred_to_bbox(
+                centers[pred_indices], sizes[pred_indices])
+            gt_tp_bbox = self._center_size_pred_to_bbox(
+                gt_centers[gt_indices], gt_sizes[gt_indices])
+            giou = axis_aligned_bbox_overlaps_3d(
+                pred_tp_bbox.unsqueeze(0), gt_tp_bbox.unsqueeze(0),
+                mode='giou', is_aligned=True)
+            giou_loss = (1.0 - giou).sum() / avg_factor
+            iou_loss = giou_loss
         center_loss = center_loss * self.loss_weights['center_loss']
         yaw_loss = yaw_loss * self.loss_weights['yaw_loss']
         iou_loss = iou_loss * self.loss_weights['iou_loss']

@@ -1,8 +1,6 @@
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
-from mmcv.ops import diff_iou_rotated_3d
-
 from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
 
 
@@ -105,14 +103,15 @@ class RepeatedHungarianMatcher(nn.Module):
         return 0.5 * torch.atan2(vectors[..., 0], vectors[..., 1])
 
     @staticmethod
-    def _pairwise_rotated_iou(pred_boxes, gt_boxes):
-        num_pred, num_gt = len(pred_boxes), len(gt_boxes)
-        pred_pairs = pred_boxes[:, None].expand(-1, num_gt, -1).reshape(
-            1, -1, 7)
-        gt_pairs = gt_boxes[None].expand(num_pred, -1, -1).reshape(
-            1, -1, 7)
-        return diff_iou_rotated_3d(pred_pairs, gt_pairs).reshape(
-            num_pred, num_gt)
+    def _pairwise_aligned_giou(pred_boxes, gt_boxes):
+        """Compute pairwise axis-aligned 3D GIoU for 7DoF boxes."""
+        pred_corners = UnifiedMatcher._center_size_pred_to_bbox(
+            None, pred_boxes[:, :3], pred_boxes[:, 3:6])
+        gt_corners = UnifiedMatcher._center_size_pred_to_bbox(
+            None, gt_boxes[:, :3], gt_boxes[:, 3:6])
+        return axis_aligned_bbox_overlaps_3d(
+            pred_corners.unsqueeze(0), gt_corners.unsqueeze(0),
+            mode='giou').squeeze(0)
 
     @torch.no_grad()
     def _get_targets(self, pred_centers, pred_sizes, pred_size_logs,
@@ -191,8 +190,8 @@ class RepeatedHungarianMatcher(nn.Module):
             gt_boxes = torch.cat((
                 repeated_centers, repeated_sizes,
                 repeated_yaws[:, None]), dim=-1)
-            rotated_iou = self._pairwise_rotated_iou(pred_boxes, gt_boxes)
-            total_cost = total_cost - self.cost_weights['iou'] * rotated_iou
+            aligned_giou = self._pairwise_aligned_giou(pred_boxes, gt_boxes)
+            total_cost = total_cost - self.cost_weights['iou'] * aligned_giou
         _ensure_finite('Hungarian cost matrix', total_cost)
 
         pred_indices, repeated_indices = linear_sum_assignment(

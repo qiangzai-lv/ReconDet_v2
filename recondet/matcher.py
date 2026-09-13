@@ -1,9 +1,8 @@
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
-from mmcv.ops import diff_iou_rotated_3d
-
 from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
+from recondet.npu_ops import diff_iou_rotated_3d
 
 
 def _ensure_finite(name, value):

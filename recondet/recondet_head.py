@@ -6,7 +6,6 @@ from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
-from mmcv.ops import diff_iou_rotated_3d, nms3d
 from mmengine.model import BaseModule
 from mmengine.structures import InstanceData
 from torch import Tensor, nn
@@ -19,6 +18,7 @@ from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3
 from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
                                         OptConfigType, OptInstanceList)
 from recondet.matcher import RepeatedHungarianMatcher
+from recondet.npu_ops import diff_iou_rotated_3d, nms3d
 
 
 def decode_size_residuals(size_residuals, initial_size_anchor,
@@ -539,22 +539,6 @@ class ReconDetHead(BaseModule):
         results.labels_3d = labels
 
         return results
-
-    def find_max_iou_from_center_size_boxes(self, boxes1, boxes2):
-        boxes1_tp = self._center_size_pred_to_bbox(boxes1[:, :3], boxes1[:, 3:6])
-        boxes2_tp = self._center_size_pred_to_bbox(boxes2[:, :3], boxes2[:, 3:6])
-        giou_2 = axis_aligned_bbox_overlaps_3d(boxes1_tp.unsqueeze(0), boxes2_tp.unsqueeze(0), mode='giou')  # giou
-        giou_max_gt, max_gt_box_idx = torch.max(giou_2, axis=2)
-        max_giou, max_pred_box_idx = torch.max(giou_max_gt, axis=1)
-        assert max_giou <= 1 and max_giou >= -1
-        return max_giou, max_gt_box_idx, max_pred_box_idx
-
-    def _center_size_pred_to_bbox(self, centers, sizes):
-        return torch.stack([
-            centers[:, 0] - sizes[:, 0] / 2.0, centers[:, 1] - sizes[:, 1] / 2.0,
-            centers[:, 2] - sizes[:, 2] / 2.0, centers[:, 0] + sizes[:, 0] / 2.0,
-            centers[:, 1] + sizes[:, 1] / 2.0, centers[:, 2] + sizes[:, 2] / 2.0
-        ], -1)
 
     def _nms(self, bboxes, scores):
         kept_boxes = []

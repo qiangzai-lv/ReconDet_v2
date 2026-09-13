@@ -1,9 +1,8 @@
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
-from mmcv.ops import diff_iou_rotated_3d
-
 from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
+from recondet.rotated_iou import rotated_iou_3d_pairwise
 
 
 def _ensure_finite(name, value):
@@ -106,13 +105,7 @@ class RepeatedHungarianMatcher(nn.Module):
 
     @staticmethod
     def _pairwise_rotated_iou(pred_boxes, gt_boxes):
-        num_pred, num_gt = len(pred_boxes), len(gt_boxes)
-        pred_pairs = pred_boxes[:, None].expand(-1, num_gt, -1).reshape(
-            1, -1, 7)
-        gt_pairs = gt_boxes[None].expand(num_pred, -1, -1).reshape(
-            1, -1, 7)
-        return diff_iou_rotated_3d(pred_pairs, gt_pairs).reshape(
-            num_pred, num_gt)
+        return rotated_iou_3d_pairwise(pred_boxes, gt_boxes)
 
     @torch.no_grad()
     def _get_targets(self, pred_centers, pred_sizes, pred_size_logs,

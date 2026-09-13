@@ -6,7 +6,7 @@ from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
-from mmcv.ops import diff_iou_rotated_3d, nms3d
+from mmcv.ops import nms3d
 from mmengine.model import BaseModule
 from mmengine.structures import InstanceData
 from torch import Tensor, nn
@@ -19,6 +19,7 @@ from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3
 from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
                                         OptConfigType, OptInstanceList)
 from recondet.matcher import RepeatedHungarianMatcher
+from recondet.rotated_iou import rotated_iou_3d_aligned
 
 
 def decode_size_residuals(size_residuals, initial_size_anchor,
@@ -449,7 +450,7 @@ class ReconDetHead(BaseModule):
             gt_boxes = torch.cat((
                 gt_centers[gt_indices], gt_sizes[gt_indices],
                 matched_gt_yaws[:, None]), dim=-1)
-            iou = diff_iou_rotated_3d(
+            iou = rotated_iou_3d_aligned(
                 pred_boxes.unsqueeze(0), gt_boxes.unsqueeze(0)).squeeze(0)
             iou_loss = (1.0 - iou).sum() / avg_factor
         center_loss = center_loss * self.loss_weights['center_loss']

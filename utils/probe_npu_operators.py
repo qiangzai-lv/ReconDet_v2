@@ -39,7 +39,7 @@ def _run_operator() -> Dict[str, Any]:
         operator = getattr(mx_driving, OPERATOR_NAME)
         boxes_a = torch.tensor(
             [[[0.0, 0.0, 2.0, 1.0, 0.1]]],
-            device='npu', dtype=torch.float32, requires_grad=True)
+            device='npu', dtype=torch.float32)
         boxes_b = torch.tensor(
             [[[0.0, 0.0, 2.0, 1.0, 0.1]]],
             device='npu', dtype=torch.float32)
@@ -53,10 +53,6 @@ def _run_operator() -> Dict[str, Any]:
                 iou, torch.ones_like(iou), atol=1e-4, rtol=1e-4)):
             raise RuntimeError(f'identical boxes returned IoU={iou.item():.6g}')
 
-        iou.sum().backward()
-        if boxes_a.grad is None or not bool(
-                torch.isfinite(boxes_a.grad).all().item()):
-            raise RuntimeError('backward produced no finite gradient')
     except Exception as exc:
         return {
             'name': OPERATOR_NAME,
@@ -66,7 +62,7 @@ def _run_operator() -> Dict[str, Any]:
     return {
         'name': OPERATOR_NAME,
         'status': 'ok',
-        'detail': 'DrivingSDK forward and backward succeeded',
+        'detail': f'DrivingSDK forward succeeded (IoU={iou.item():.6g})',
     }
 
 

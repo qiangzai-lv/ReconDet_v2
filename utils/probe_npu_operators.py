@@ -7,11 +7,8 @@ that the corresponding CANN/OPP kernel is registered and runnable.
 """
 
 import argparse
-import ctypes
-import ctypes.util
 import json
 import os
-from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 
@@ -37,65 +34,36 @@ def _environment() -> Dict[str, str]:
     return {key: os.environ.get(key, '') for key in keys}
 
 
-def _libopapi_candidates() -> List[Path]:
-    candidates = []
-    for key in ('ASCEND_HOME_PATH', 'ASCEND_TOOLKIT_HOME'):
-        root = os.environ.get(key)
-        if root:
-            root = Path(root)
-            candidates.extend((root / 'lib64' / 'libopapi.so',
-                               root / 'runtime' / 'lib64' / 'libopapi.so'))
-    candidates.extend((
-        Path('/usr/local/Ascend/ascend-toolkit/latest/lib64/libopapi.so'),
-        Path('/usr/local/Ascend/ascend-toolkit/latest/runtime/lib64/libopapi.so'),
-        Path('/usr/local/Ascend/latest/lib64/libopapi.so'),
-    ))
-    discovered = ctypes.util.find_library('opapi')
-    if discovered:
-        candidates.append(Path(discovered))
-    unique = []
-    seen = set()
-    for candidate in candidates:
-        candidate = candidate.resolve()
-        if candidate not in seen:
-            unique.append(candidate)
-            seen.add(candidate)
-    return unique
-
-
 def _probe_runtime_operator() -> Dict[str, str]:
-    """Check the ACLNN symbol before importing or executing model code."""
-    candidates = _libopapi_candidates()
-    existing = [path for path in candidates if path.is_file()]
-    # ``find_library`` can return a soname resolved only by the dynamic
-    # loader, so retain it as a load candidate even when it is not a file.
-    load_candidates = [str(path) for path in candidates if not path.is_absolute()]
-    existing_names = [str(path) for path in existing] + load_candidates
-    if not existing_names:
+    """Invoke the low-level custom op instead of inspecting ELF symbols."""
+    try:
+        torch, mx_driving = _load_runtime()
+        operator = getattr(
+            getattr(mx_driving, '_C', None),
+            'diff_iou_rotated_sort_vertices', None)
+        if operator is None:
+            raise AttributeError(
+                'mx_driving._C.diff_iou_rotated_sort_vertices is not exported')
+        vertices = torch.zeros((1, 1, 9, 2), device='npu', dtype=torch.float32)
+        mask = torch.zeros((1, 1, 9), device='npu', dtype=torch.bool)
+        mask[:, :, :4] = True
+        num_valid = torch.full(
+            (1, 1), 4, device='npu', dtype=torch.int32)
+        output = operator(vertices, mask, num_valid)
+        if tuple(output.shape) != (1, 1, 9):
+            raise RuntimeError(f'unexpected output shape: {tuple(output.shape)}')
         return {
             'name': RUNTIME_OPERATOR_NAME,
-            'status': 'unavailable',
-            'detail': 'libopapi.so was not found in configured/common paths',
+            'status': 'ok',
+            'detail': 'direct invocation succeeded',
         }
-    load_errors = []
-    for path in existing_names:
-        try:
-            library = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-        except OSError as exc:
-            load_errors.append(f'{path}: {exc}')
-            continue
-        if getattr(library, RUNTIME_OPERATOR_NAME, None) is not None:
-            return {
-                'name': RUNTIME_OPERATOR_NAME,
-                'status': 'ok',
-                'library': path,
-            }
-        load_errors.append(f'{path}: symbol not exported')
-    return {
-        'name': RUNTIME_OPERATOR_NAME,
-        'status': 'failed',
-        'detail': '; '.join(load_errors),
-    }
+    except Exception as exc:
+        unavailable = isinstance(exc, (ImportError, ModuleNotFoundError))
+        return {
+            'name': RUNTIME_OPERATOR_NAME,
+            'status': 'unavailable' if unavailable else 'failed',
+            'detail': f'{type(exc).__name__}: {exc}',
+        }
 
 
 def _load_runtime():

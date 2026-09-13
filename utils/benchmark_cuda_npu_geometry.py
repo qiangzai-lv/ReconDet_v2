@@ -63,14 +63,22 @@ def _numeric_error(left: Sequence[float], right: Sequence[float], atol: float,
             'max_rel_error': None,
         }
     delta = np.abs(a - b)
-    denominator = np.maximum(np.abs(b), np.finfo(np.float64).eps)
+    # A relative error against a near-zero reference is not informative and
+    # can become millions due to floating-point noise. Use the same absolute
+    # tolerance as a denominator floor and expose how many entries were below
+    # that floor.
+    denominator = np.maximum(np.abs(b), atol)
     relative = delta / denominator
+    meaningful = np.abs(b) > atol
     close = bool(np.allclose(a, b, atol=atol, rtol=rtol, equal_nan=False))
     return {
         'exact': close,
         'shape': list(a.shape),
         'max_abs_error': round(float(delta.max()) if delta.size else 0.0, 12),
         'max_rel_error': round(float(relative.max()) if relative.size else 0.0, 12),
+        'max_rel_error_meaningful': round(
+            float(relative[meaningful].max()) if meaningful.any() else 0.0, 12),
+        'relative_ignored': int((~meaningful).sum()),
     }
 
 
@@ -84,8 +92,6 @@ def compare_payloads(cuda: Dict[str, object], npu: Dict[str, object],
     if left_inputs or right_inputs:
         reports['inputs'] = {
             'exact': left_inputs == right_inputs,
-            'cuda': left_inputs,
-            'npu': right_inputs,
         }
     all_names = sorted(set(cuda.get('results', {})) | set(npu.get('results', {})))
     for name in all_names:
@@ -112,8 +118,12 @@ def compare_payloads(cuda: Dict[str, object], npu: Dict[str, object],
                     per_class[cls] = {
                         'exact': sorted(left_cls) == sorted(right_cls),
                         'exact_order': left_cls == right_cls,
-                        'left': left_cls,
-                        'right': right_cls,
+                        'left_count': len(left_cls),
+                        'right_count': len(right_cls),
+                        'intersection_count': len(
+                            set(left_cls).intersection(right_cls)),
+                        'symmetric_difference_count': len(
+                            set(left_cls).symmetric_difference(right_cls)),
                     }
                 reports[name] = {
                     'exact': all(x['exact'] for x in per_class.values()),
@@ -125,8 +135,12 @@ def compare_payloads(cuda: Dict[str, object], npu: Dict[str, object],
                 reports[name] = {
                     'exact': left_indices == right_indices,
                     'exact_order': left['indices'] == right['indices'],
-                    'left': left['indices'],
-                    'right': right['indices'],
+                    'left_count': len(left['indices']),
+                    'right_count': len(right['indices']),
+                    'intersection_count': len(
+                        set(left['indices']).intersection(right['indices'])),
+                    'symmetric_difference_count': len(
+                        set(left['indices']).symmetric_difference(right['indices'])),
                 }
         else:
             reports[name] = {'exact': False, 'error': 'incompatible result format'}

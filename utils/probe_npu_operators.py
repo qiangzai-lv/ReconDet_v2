@@ -7,9 +7,11 @@ that the corresponding CANN/OPP kernel is registered and runnable.
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import os
-import traceback
+from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 
@@ -20,6 +22,7 @@ CHECK_NAMES = (
     'nms3d',
     'nms3d_normal',
 )
+RUNTIME_OPERATOR_NAME = 'aclnnDiffIouRotatedSortVertices'
 
 
 def _check(name: str, status: str, detail: str = '') -> Dict[str, str]:
@@ -32,6 +35,67 @@ def _check(name: str, status: str, detail: str = '') -> Dict[str, str]:
 def _environment() -> Dict[str, str]:
     keys = ('ASCEND_HOME_PATH', 'ASCEND_OPP_PATH', 'ASCEND_CUSTOM_OPP_PATH')
     return {key: os.environ.get(key, '') for key in keys}
+
+
+def _libopapi_candidates() -> List[Path]:
+    candidates = []
+    for key in ('ASCEND_HOME_PATH', 'ASCEND_TOOLKIT_HOME'):
+        root = os.environ.get(key)
+        if root:
+            root = Path(root)
+            candidates.extend((root / 'lib64' / 'libopapi.so',
+                               root / 'runtime' / 'lib64' / 'libopapi.so'))
+    candidates.extend((
+        Path('/usr/local/Ascend/ascend-toolkit/latest/lib64/libopapi.so'),
+        Path('/usr/local/Ascend/ascend-toolkit/latest/runtime/lib64/libopapi.so'),
+        Path('/usr/local/Ascend/latest/lib64/libopapi.so'),
+    ))
+    discovered = ctypes.util.find_library('opapi')
+    if discovered:
+        candidates.append(Path(discovered))
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate not in seen:
+            unique.append(candidate)
+            seen.add(candidate)
+    return unique
+
+
+def _probe_runtime_operator() -> Dict[str, str]:
+    """Check the ACLNN symbol before importing or executing model code."""
+    candidates = _libopapi_candidates()
+    existing = [path for path in candidates if path.is_file()]
+    # ``find_library`` can return a soname resolved only by the dynamic
+    # loader, so retain it as a load candidate even when it is not a file.
+    load_candidates = [str(path) for path in candidates if not path.is_absolute()]
+    existing_names = [str(path) for path in existing] + load_candidates
+    if not existing_names:
+        return {
+            'name': RUNTIME_OPERATOR_NAME,
+            'status': 'unavailable',
+            'detail': 'libopapi.so was not found in configured/common paths',
+        }
+    load_errors = []
+    for path in existing_names:
+        try:
+            library = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+        except OSError as exc:
+            load_errors.append(f'{path}: {exc}')
+            continue
+        if getattr(library, RUNTIME_OPERATOR_NAME, None) is not None:
+            return {
+                'name': RUNTIME_OPERATOR_NAME,
+                'status': 'ok',
+                'library': path,
+            }
+        load_errors.append(f'{path}: symbol not exported')
+    return {
+        'name': RUNTIME_OPERATOR_NAME,
+        'status': 'failed',
+        'detail': '; '.join(load_errors),
+    }
 
 
 def _load_runtime():
@@ -131,18 +195,25 @@ def _run_checks() -> List[Dict[str, str]]:
 def probe(dry_run: bool = False) -> Dict[str, Any]:
     checks = ([_check(name, 'skipped', 'dry run') for name in CHECK_NAMES]
               if dry_run else _run_checks())
+    runtime_operator = {
+        'name': RUNTIME_OPERATOR_NAME,
+        'status': 'skipped',
+        'detail': 'dry run',
+    } if dry_run else _probe_runtime_operator()
     if dry_run:
         return {
             'status': 'skipped',
             'dry_run': True,
             'device': 'npu',
             'environment': _environment(),
+            'runtime_operator': runtime_operator,
             'checks': checks,
         }
     statuses = {item['status'] for item in checks}
-    if statuses == {'ok'}:
+    if statuses == {'ok'} and runtime_operator['status'] == 'ok':
         status = 'ok'
-    elif statuses == {'unavailable'}:
+    elif (statuses == {'unavailable'}
+          and runtime_operator['status'] == 'unavailable'):
         status = 'unavailable'
     else:
         status = 'failed'
@@ -151,6 +222,7 @@ def probe(dry_run: bool = False) -> Dict[str, Any]:
         'dry_run': dry_run,
         'device': 'npu',
         'environment': _environment(),
+        'runtime_operator': runtime_operator,
         'checks': checks,
     }
 

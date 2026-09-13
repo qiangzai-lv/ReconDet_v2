@@ -370,7 +370,8 @@ def _device_info(torch, device):
     return info
 
 
-def run_benchmark(device_name: str, warmup: int, repeats: int) -> Dict[str, object]:
+def run_benchmark(device_name: str, warmup: int, repeats: int,
+                  matched_count: int = 1280) -> Dict[str, object]:
     torch = importlib.import_module('torch')
     if device_name == 'cuda':
         if not torch.cuda.is_available():
@@ -391,26 +392,32 @@ def run_benchmark(device_name: str, warmup: int, repeats: int) -> Dict[str, obje
         raise ValueError('device must be cuda or npu')
 
     pred, gt, scores = _build_inputs(torch, device)
+    if matched_count < 1:
+        raise ValueError('matched_count must be positive')
+    matched_pred = pred[:, :1].expand(-1, matched_count, -1).contiguous()
+    matched_gt = gt[:, :1].expand(-1, matched_count, -1).contiguous()
     if device_name == 'cuda':
         pairwise_call = lambda: _cuda_pairwise(torch, pred, gt)
-        matched_call = lambda: _cuda_matched(torch, pred[:, :gt.shape[1]], gt)
+        matched_call = lambda: _cuda_matched(
+            torch, matched_pred, matched_gt)
         nms_call = lambda: _cuda_nms(torch, pred[0], scores, 0.25)
     else:
         pairwise_call = lambda: _npu_pairwise(torch, mx_driving, pred, gt)
         matched_call = lambda: _npu_matched(
-            torch, mx_driving, pred[:, :gt.shape[1]], gt)
+            torch, mx_driving, matched_pred, matched_gt)
         nms_call = lambda: _npu_nms(torch, mx_driving, pred[0], scores, 0.25)
 
     pairwise, pairwise_timing = _timed(
         torch, device, pairwise_call, warmup, repeats)
     matched, matched_timing = _timed(
         torch, device, matched_call, warmup, repeats)
-    pred_grad = pred[:, :gt.shape[1]].detach().clone().requires_grad_(True)
+    pred_grad = matched_pred.detach().clone().requires_grad_(True)
     if device_name == 'cuda':
-        backward_call = lambda: _cuda_matched(torch, pred_grad, gt).sum()
+        backward_call = lambda: _cuda_matched(
+            torch, pred_grad, matched_gt).sum()
     else:
         backward_call = lambda: _npu_matched(
-            torch, mx_driving, pred_grad, gt).sum()
+            torch, mx_driving, pred_grad, matched_gt).sum()
     for _ in range(warmup):
         pred_grad.grad = None
         backward_call().backward()
@@ -430,7 +437,12 @@ def run_benchmark(device_name: str, warmup: int, repeats: int) -> Dict[str, obje
     return {
         'status': 'ok',
         'device': _device_info(torch, device),
-        'config': {'warmup': warmup, 'repeats': repeats, 'seed': 20260913},
+        'config': {
+            'warmup': warmup,
+            'repeats': repeats,
+            'seed': 20260913,
+            'matched_count': matched_count,
+        },
         'inputs': {
             'pred_shape': list(pred.shape),
             'gt_shape': list(gt.shape),
@@ -462,6 +474,9 @@ def main(argv: List[str] = None) -> int:
     parser.add_argument('--compare', nargs=2, type=Path, metavar=('CUDA_JSON', 'NPU_JSON'))
     parser.add_argument('--warmup', type=int, default=10)
     parser.add_argument('--repeats', type=int, default=50)
+    parser.add_argument(
+        '--matched-count', type=int, default=1280,
+        help='aligned IoU count; defaults above DrivingSDK N<=1024 limit')
     parser.add_argument('--atol', type=float, default=1e-4)
     parser.add_argument('--rtol', type=float, default=1e-4)
     parser.add_argument('--json', action='store_true')
@@ -478,7 +493,8 @@ def main(argv: List[str] = None) -> int:
         payload = compare_payloads(cuda, npu, args.atol, args.rtol)
     elif args.device:
         try:
-            payload = run_benchmark(args.device, args.warmup, args.repeats)
+            payload = run_benchmark(
+                args.device, args.warmup, args.repeats, args.matched_count)
         except Exception as exc:
             payload = {
                 'status': 'failed',

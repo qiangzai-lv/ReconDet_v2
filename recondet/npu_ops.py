@@ -10,6 +10,9 @@ import importlib
 import torch
 
 
+_DRIVINGSDK_MAX_ALIGNED_BOXES = 1024
+
+
 def _driving_op(name):
     driving = importlib.import_module('mx_driving')
     op = getattr(driving, name, None)
@@ -38,7 +41,14 @@ def npu_aligned_3d_iou(boxes_a, boxes_b):
             format ``[x, y, z, w, l, h, yaw]``. Yaw is in radians.
     """
     _validate_aligned_boxes(boxes_a, boxes_b)
-    op = _driving_op('diff_iou_rotated_2d')
+    if boxes_a.shape[1] > _DRIVINGSDK_MAX_ALIGNED_BOXES:
+        chunks = []
+        for start in range(0, boxes_a.shape[1],
+                           _DRIVINGSDK_MAX_ALIGNED_BOXES):
+            end = start + _DRIVINGSDK_MAX_ALIGNED_BOXES
+            chunks.append(npu_aligned_3d_iou(
+                boxes_a[:, start:end], boxes_b[:, start:end]))
+        return torch.cat(chunks, dim=1)
     # DrivingSDK's differentiable IoU contract is float32. Casting here keeps
     # the wrapper usable under AMP while preserving gradients through cast().
     boxes_a = boxes_a.float()
@@ -49,7 +59,16 @@ def npu_aligned_3d_iou(boxes_a, boxes_b):
     bev_b = torch.stack(
         (boxes_b[..., 0], boxes_b[..., 1], boxes_b[..., 3],
          boxes_b[..., 4], boxes_b[..., 6]), dim=-1).contiguous()
-    bev_iou = op(bev_a, bev_b)
+    try:
+        bev_iou = _driving_op('diff_iou_rotated_2d')(bev_a, bev_b)
+    except RuntimeError as exc:
+        if 'DiffIouRotatedSortVertices' not in str(exc):
+            raise
+        raise RuntimeError(
+            'CANN/DrivingSDK does not provide '
+            'DiffIouRotatedSortVertices. Check that the CANN toolkit, '
+            'torch_npu, and mx_driving versions are compatible and that '
+            'the intended libopapi.so is first on LD_LIBRARY_PATH.') from exc
 
     area_a = boxes_a[..., 3] * boxes_a[..., 4]
     area_b = boxes_b[..., 3] * boxes_b[..., 4]

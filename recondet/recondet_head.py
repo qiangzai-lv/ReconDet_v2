@@ -569,8 +569,14 @@ class ReconDetHead(BaseModule):
             candidate_boxes = bboxes[candidates]
             candidate_scores = class_scores[candidates]
             if bboxes.device.type == 'npu':
-                class_keep = self._npu_nms3d(
-                    candidate_boxes, candidate_scores,
+                # No supported rotated NMS kernel is available on NPU.
+                # Suppress with axis-aligned 3D IoU, but retain the original
+                # rotated boxes (including yaw) in the output.
+                candidate_corners = self._center_size_pred_to_bbox(
+                    candidate_boxes[:, :3], candidate_boxes[:, 3:6])
+                class_keep = self.aligned_3d_nms(
+                    candidate_corners, candidate_scores,
+                    torch.full_like(candidates, class_id),
                     self.test_cfg.iou_thr)
             else:
                 from mmcv.ops import nms3d
@@ -589,18 +595,6 @@ class ReconDetHead(BaseModule):
         labels = torch.cat(kept_labels)
         order = scores.argsort(descending=True)
         return bboxes[order], scores[order], labels[order]
-
-    @staticmethod
-    def _npu_nms3d(boxes, scores, threshold):
-        """Run the DrivingSDK 3D NMS operator on Ascend."""
-        import mx_driving
-
-        # Match the benchmark adapter: SDK versions expose the operator
-        # either at the package root or under ``detection``.
-        op = getattr(mx_driving, 'nms3d', None)
-        if op is None:
-            op = mx_driving.detection.nms3d
-        return op(boxes, scores, threshold)
 
     @staticmethod
     def aligned_3d_nms(boxes, scores, classes, thresh):

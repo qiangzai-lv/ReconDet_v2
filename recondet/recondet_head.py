@@ -6,7 +6,6 @@ from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
-from mmcv.ops import nms3d
 from mmengine.model import BaseModule
 from mmengine.structures import InstanceData
 from torch import Tensor, nn
@@ -567,9 +566,17 @@ class ReconDetHead(BaseModule):
                 as_tuple=False).flatten()
             if candidates.numel() == 0:
                 continue
-            class_keep = nms3d(
-                bboxes[candidates], class_scores[candidates],
-                self.test_cfg.iou_thr)
+            candidate_boxes = bboxes[candidates]
+            candidate_scores = class_scores[candidates]
+            if bboxes.device.type == 'npu':
+                class_keep = self._npu_nms3d(
+                    candidate_boxes, candidate_scores,
+                    self.test_cfg.iou_thr)
+            else:
+                from mmcv.ops import nms3d
+                class_keep = nms3d(
+                    candidate_boxes, candidate_scores,
+                    self.test_cfg.iou_thr)
             kept_boxes.append(bboxes[candidates[class_keep]])
             kept_scores.append(class_scores[candidates[class_keep]])
             kept_labels.append(torch.full_like(
@@ -582,6 +589,18 @@ class ReconDetHead(BaseModule):
         labels = torch.cat(kept_labels)
         order = scores.argsort(descending=True)
         return bboxes[order], scores[order], labels[order]
+
+    @staticmethod
+    def _npu_nms3d(boxes, scores, threshold):
+        """Run the DrivingSDK 3D NMS operator on Ascend."""
+        import mx_driving
+
+        # Match the benchmark adapter: SDK versions expose the operator
+        # either at the package root or under ``detection``.
+        op = getattr(mx_driving, 'nms3d', None)
+        if op is None:
+            op = mx_driving.detection.nms3d
+        return op(boxes, scores, threshold)
 
     @staticmethod
     def aligned_3d_nms(boxes, scores, classes, thresh):

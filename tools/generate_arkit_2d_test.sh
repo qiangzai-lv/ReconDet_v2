@@ -8,7 +8,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-/root/shared-nvme/data/arkit_coco}"
 NUM_VIEWS="${NUM_VIEWS:-50}"
 NUM_SHARDS="${NUM_SHARDS:-1}"
 SHARD_ID="${SHARD_ID:-0}"
-ANN_FILE="${DATA_ROOT}/arkit_infos_val.pkl"
+ANN_FILE="${DATA_ROOT}/arkit_infos_val_10.pkl"
 SCENE_OUTPUT_DIR="${SCENE_OUTPUT_DIR:-${OUTPUT_ROOT}/arkit_bbox_val_scenes}"
 
 mkdir -p "${OUTPUT_ROOT}" "${SCENE_OUTPUT_DIR}"
@@ -32,7 +32,7 @@ exec "${PYTHON_BIN}" utils/scannet_3d_to_coco_bbox.py \
   --center-window-fraction 0.1 \
   --center-window-min-size 2 \
   --center-window-max-size 6 \
-  --visualize \
-  --visualization-dir "${OUTPUT_ROOT}/val_visualizations" \
-  --visualization-max-images "${VISUALIZATION_MAX_IMAGES:--1}" \
+#  --visualize \
+#  --visualization-dir "${OUTPUT_ROOT}/val_visualizations" \
+#  --visualization-max-images "${VISUALIZATION_MAX_IMAGES:--1}" \
   --log-level INFO

@@ -5,8 +5,8 @@ _base_ = [
 
 load_from = '/root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
 
-data_root = '/root/shared-nvme/data/ScanNet_processed_v2/'
-scannet_ann_root = '/root/shared-nvme/data/scannet_coco_v2/'
+data_root = '/root/shared-nvme/data/ARKitScenes_processed/'
+arkit_ann_root = '/root/shared-nvme/data/arkit_coco/'
 
 lang_model_name = '/root/shared-nvme/data/pretrain/bert-base-uncased'
 
@@ -175,9 +175,9 @@ test_pipeline = [
 dataset_type = 'CocoDataset'
 
 metainfo = dict(classes=(
-    'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window',
-    'bookshelf', 'picture', 'counter', 'desk', 'curtain', 'refrigerator',
-    'showercurtrain', 'toilet', 'sink', 'bathtub', 'garbagebin'))
+    'cabinet', 'refrigerator', 'shelf', 'stove', 'bed', 'sink', 'washer',
+    'toilet', 'bathtub', 'oven', 'dishwasher', 'fireplace', 'stool', 'chair',
+    'table', 'tv_monitor', 'sofa'))
 
 backend_args = None
 
@@ -190,7 +190,7 @@ train_dataloader = dict(
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=scannet_ann_root + 'keypoints_bbox_train.json',
+    ann_file=arkit_ann_root + 'keypoints_bbox_train.json',
         data_prefix=dict(img=''),
         metainfo=metainfo,
         return_classes=True,
@@ -206,7 +206,7 @@ val_dataloader = dict(
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=scannet_ann_root + 'keypoints_bbox_val.json',
+    ann_file=arkit_ann_root + 'keypoints_bbox_val.json',
         data_prefix=dict(img=''),
         metainfo=metainfo,
         return_classes=True,
@@ -217,7 +217,7 @@ test_dataloader = val_dataloader
 
 val_evaluator = dict(
     type='CocoMetric',
-    ann_file=scannet_ann_root + 'keypoints_bbox_val_100.json',
+    ann_file=arkit_ann_root + 'keypoints_bbox_val.json',
     metric='bbox',
     classwise=True,
     format_only=False,

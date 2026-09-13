@@ -67,7 +67,7 @@ class PackNeRFDetInputs(BaseTransform):
         'c2w', 'intrinsic', 'points', 'pose_matrix', 'axis_align_matrix',
         'avg_distance', 'gt_depths_vggt', 'gt_depth_valid_masks',
         'gt_scene_points_vggt', 'gt_extrinsics_vggt', 'gt_c2w_vggt',
-        'gt_intrinsics', 'vggt_gt_scale'
+        'gt_intrinsics', 'vggt_gt_scale', 'scene_bounds'
     ]
 
     INSTANCEDATA_3D_KEYS = [
@@ -288,7 +288,8 @@ class PackNeRFDetInputs(BaseTransform):
         for key in (
                 'gt_depths_vggt', 'gt_depth_valid_masks',
                 'gt_scene_points_vggt', 'gt_extrinsics_vggt',
-                'gt_c2w_vggt', 'gt_intrinsics', 'vggt_gt_scale'):
+                'gt_c2w_vggt', 'gt_intrinsics', 'vggt_gt_scale',
+                'scene_bounds'):
             if key in results and not isinstance(results[key], torch.Tensor):
                 results[key] = to_tensor(results[key])
 

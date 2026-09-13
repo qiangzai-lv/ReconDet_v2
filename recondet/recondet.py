@@ -10,7 +10,7 @@ from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
 from recondet.camera_alignment import (
     denormalize_vggt_gt_cameras, denormalize_vggt_gt_points,
-    load_axis_aligned_points, normalize_query_points)
+    load_axis_aligned_points, normalize_query_points, robust_scene_bounds)
 from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.device import autocast, get_device
@@ -273,6 +273,8 @@ class ReconDet(Base3DDetector):
                 pose_encoding.detach(), images.shape[-2:])
         scene_scale = self._resolve_vggt_gt_scale(
             batch_inputs_dict, batch_data_samples, images)
+        scene_bounds = self._resolve_scene_bounds(
+            batch_inputs_dict, batch_data_samples, images)
         aligned_extrinsics = denormalize_vggt_gt_cameras(
             extrinsics,
             batch_inputs_dict['pose_matrix'],
@@ -283,6 +285,7 @@ class ReconDet(Base3DDetector):
         if not torch.isfinite(intrinsics).all():
             raise FloatingPointError('VGGT intrinsics contain non-finite values')
         batch_inputs_dict['vggt_gt_scale'] = scene_scale.detach()
+        batch_inputs_dict['scene_bounds'] = scene_bounds.detach()
         batch_inputs_dict['vggt_raw_extrinsics'] = extrinsics.detach()
         batch_inputs_dict['vggt_extrinsics'] = aligned_extrinsics.detach()
         batch_inputs_dict['vggt_intrinsics'] = intrinsics.detach()
@@ -292,6 +295,24 @@ class ReconDet(Base3DDetector):
         if return_pose_encoding:
             return cameras + (pose_encoding,)
         return cameras
+
+    @torch.no_grad()
+    def _resolve_scene_bounds(self, batch_inputs_dict, batch_data_samples,
+                              reference):
+        provided = batch_inputs_dict.get('scene_bounds')
+        if provided is not None:
+            bounds = torch.as_tensor(
+                provided, device=reference.device,
+                dtype=torch.float32).reshape(-1, 2, 3)
+            if bounds.shape[0] != len(batch_data_samples):
+                raise ValueError('scene_bounds must have shape [B, 2, 3]')
+            return bounds
+        bounds = []
+        for data_sample in batch_data_samples:
+            _, points_aligned = self._load_axis_aligned_gt_points(
+                data_sample.metainfo)
+            bounds.append(robust_scene_bounds(points_aligned))
+        return reference.new_tensor(np.stack(bounds), dtype=torch.float32)
 
     def _align_reconstruction_outputs(self, reconstruction_outputs,
                                       batch_inputs_dict, images):
@@ -304,7 +325,8 @@ class ReconDet(Base3DDetector):
             points_vggt,
             batch_inputs_dict['pose_matrix'],
             batch_inputs_dict['axis_align_matrix'],
-            batch_inputs_dict['vggt_gt_scale'])
+            batch_inputs_dict['vggt_gt_scale'],
+            batch_inputs_dict['vggt_raw_extrinsics'])
         outputs = dict(reconstruction_outputs)
         outputs['points_aligned'] = points_aligned.reshape(
             batch_size * num_views, query_count, 3)
@@ -368,7 +390,8 @@ class ReconDet(Base3DDetector):
         query_xyz = query_xyz.to(device=images.device, dtype=images.dtype)
         query = query.to(device=images.device, dtype=feature_maps[0].dtype)
         reference_points, reference_min, reference_max = normalize_query_points(
-            query_xyz, self.query_xyz_range)
+            query_xyz, batch_inputs_dict.get(
+                'scene_bounds', self.query_xyz_range))
         batch_inputs_dict['query_xyz'] = query_xyz
         batch_inputs_dict['reference_min'] = reference_min
         batch_inputs_dict['reference_max'] = reference_max

@@ -6,6 +6,7 @@ from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
+from mmcv.ops import diff_iou_rotated_3d, nms3d
 from mmengine.model import BaseModule
 from mmengine.structures import InstanceData
 from torch import Tensor, nn
@@ -68,6 +69,21 @@ def matched_size_residual_loss(size_residuals, size_reference_logs, gt_sizes,
     return loss / max(float(avg_factor), 1.0)
 
 
+def encode_yaw(yaw):
+    return torch.stack((torch.sin(2.0 * yaw), torch.cos(2.0 * yaw)), dim=-1)
+
+
+def decode_yaw(yaw_vectors):
+    yaw_vectors = F.normalize(yaw_vectors, dim=-1, eps=1e-6)
+    return 0.5 * torch.atan2(yaw_vectors[..., 0], yaw_vectors[..., 1])
+
+
+def periodic_yaw_loss(yaw_vectors, target_yaw, reduction='mean'):
+    predicted = F.normalize(yaw_vectors, dim=-1, eps=1e-6)
+    target = encode_yaw(target_yaw).to(predicted)
+    return F.smooth_l1_loss(predicted, target, reduction=reduction)
+
+
 
 @MODELS.register_module()
 class ReconDetHead(BaseModule):
@@ -87,9 +103,11 @@ class ReconDetHead(BaseModule):
                  init_cfg: OptConfigType = None,
                  mlp_dropout=0.3,
                  matcher_cost_weights={
-                     'cls': 2.0, 'center': 1.0, 'size': 1.0, 'giou': 2.0},
+                     'cls': 2.0, 'center': 1.0, 'size': 1.0,
+                     'yaw': 1.0, 'iou': 2.0},
                  loss_weights={'center_loss': 2.0, 'size_loss': 1.0,
-                               'cls_loss': 2.0, 'iou_loss': 2.0},
+                               'yaw_loss': 1.0, 'cls_loss': 2.0,
+                               'iou_loss': 2.0},
                  if_v2_head=False,
                  matcher='repeated_hungarian',
                  loss_layer_ids=None,
@@ -169,12 +187,16 @@ class ReconDetHead(BaseModule):
             dropout=None,
             input_dim=n_channels)
         size_head = size_mlp_func(output_dim=3)
+        yaw_head = self.mlp_func(output_dim=2)
         semcls_head = self.mlp_func(output_dim=n_classes)
         self.center_heads = nn.ModuleList([
             copy.deepcopy(center_head) for _ in range(n_levels)
         ])
         self.size_heads = nn.ModuleList([
             copy.deepcopy(size_head) for _ in range(n_levels)
+        ])
+        self.yaw_heads = nn.ModuleList([
+            copy.deepcopy(yaw_head) for _ in range(n_levels)
         ])
         self.semcls_heads = nn.ModuleList([
             copy.deepcopy(semcls_head) for _ in range(n_levels)
@@ -185,6 +207,10 @@ class ReconDetHead(BaseModule):
         for size_head in self.size_heads:
             nn.init.constant_(size_head.layers[-1].weight, 0.)
             nn.init.constant_(size_head.layers[-1].bias, 0.)
+        for yaw_head in self.yaw_heads:
+            nn.init.constant_(yaw_head.layers[-1].weight, 0.)
+            nn.init.constant_(yaw_head.layers[-1].bias, 0.)
+            yaw_head.layers[-1].bias.data[1] = 1.0
         prior_bias = -math.log((1.0 - 0.01) / 0.01)
         for semcls_head in self.semcls_heads:
             nn.init.constant_(semcls_head.layers[-1].bias, prior_bias)
@@ -203,11 +229,13 @@ class ReconDetHead(BaseModule):
 
         center_preds = []
         size_residual_preds = []
+        yaw_preds = []
         cls_preds = []
         for feature, center, layer_id in zip(
                 x, refined_query_xyz, layer_ids):
             center_preds.append(center.permute(0, 2, 1))
             size_residual_preds.append(self.size_heads[layer_id](feature))
+            yaw_preds.append(self.yaw_heads[layer_id](feature))
             cls_preds.append(self.semcls_heads[layer_id](feature))
         with torch.autocast(device_type=size_residual_preds[0].device.type,
                             enabled=False):
@@ -222,6 +250,7 @@ class ReconDetHead(BaseModule):
             size_residual_preds=size_residual_preds,
             size_reference_logs=size_reference_logs,
             size_log_preds=size_log_preds,
+            yaw_preds=yaw_preds,
             cls_preds=cls_preds)
 
     def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
@@ -249,9 +278,11 @@ class ReconDetHead(BaseModule):
                        outputs['center_preds'], outputs['size_preds'],
                        outputs['size_residual_preds'],
                        outputs['size_reference_logs'],
-                       outputs['size_log_preds'], outputs['cls_preds'], layer_ids,
+                       outputs['size_log_preds'], outputs['yaw_preds'],
+                       outputs['cls_preds'], layer_ids,
                        batch_gt_instances_3d, batch_input_metas,
-                       batch_input_points, batch_gt_instances_ignore)
+                       batch_input_points, batch_gt_instances_ignore,
+                       batch_inputs_dict.get('scene_bounds'))
         losses = self.loss_by_feat(*loss_inputs)
         return losses
 
@@ -261,6 +292,7 @@ class ReconDetHead(BaseModule):
                      size_residual_preds: List[List[Tensor]],
                      size_reference_logs: List[List[Tensor]],
                      size_log_preds: List[List[Tensor]],
+                     yaw_preds: List[List[Tensor]],
                      cls_preds: List[List[Tensor]],
                      layer_ids: List[int],
                      #  objness_preds: List[List[Tensor]],
@@ -268,6 +300,7 @@ class ReconDetHead(BaseModule):
                      batch_input_metas: List[dict],
                      batch_input_points,
                      batch_gt_instances_ignore: OptInstanceList = None,
+                     batch_scene_bounds=None,
                      **kwargs) -> dict:
 
         if layer_ids[-1] >= len(center_preds):
@@ -278,25 +311,31 @@ class ReconDetHead(BaseModule):
             center_losses = []
             size_losses = []
             cls_losses = []
-            giou_losses = []
+            yaw_losses = []
+            iou_losses = []
             matches = []
             for batch_id in range(len(batch_input_metas)):
                 gt_bboxes = batch_gt_instances_3d[batch_id].bboxes_3d
                 gt_sizes = gt_bboxes.tensor[:, 3:6].clamp_min(1e-5)
+                scene_bounds = (None if batch_scene_bounds is None else
+                                batch_scene_bounds[batch_id])
                 matches.append(self.matcher._get_targets(
                     center_preds[layer_id][batch_id].t(),
                     size_preds[layer_id][batch_id].t(),
                     size_log_preds[layer_id][batch_id].t(),
+                    yaw_preds[layer_id][batch_id].t(),
                     cls_preds[layer_id][batch_id].t(),
                     gt_bboxes.gravity_center,
                     gt_sizes,
-                    batch_gt_instances_3d[batch_id].labels_3d))
+                    gt_bboxes.tensor[:, 6],
+                    batch_gt_instances_3d[batch_id].labels_3d,
+                    center_range=scene_bounds))
             local_num_pos = sum(match[0].numel() for match in matches)
             avg_factor = reduce_mean(center_preds[layer_id][0].new_tensor(
                 [local_num_pos], dtype=torch.float32)).clamp_min(1.0).item()
 
             for batch_id in range(len(batch_input_metas)):
-                center_loss, size_loss, cls_loss, giou_loss = \
+                center_loss, size_loss, yaw_loss, cls_loss, iou_loss = \
                     self._loss_by_feat_single(
                         center_pred=center_preds[layer_id][batch_id],
                         size_pred=size_preds[layer_id][batch_id],
@@ -305,6 +344,7 @@ class ReconDetHead(BaseModule):
                         size_reference_log=(
                             size_reference_logs[layer_id][batch_id]),
                         size_log_pred=size_log_preds[layer_id][batch_id],
+                        yaw_pred=yaw_preds[layer_id][batch_id],
                         cls_pred=cls_preds[layer_id][batch_id],
                         input_meta=batch_input_metas[batch_id],
                         gt_bboxes=batch_gt_instances_3d[
@@ -313,16 +353,20 @@ class ReconDetHead(BaseModule):
                             batch_id].labels_3d,
                         input_points=batch_input_points[batch_id],
                         match_indices=matches[batch_id],
-                        avg_factor=avg_factor)
+                        avg_factor=avg_factor,
+                        scene_bounds=(None if batch_scene_bounds is None else
+                                      batch_scene_bounds[batch_id]))
                 center_losses.append(center_loss)
                 size_losses.append(size_loss)
                 cls_losses.append(cls_loss)
-                giou_losses.append(giou_loss)
+                yaw_losses.append(yaw_loss)
+                iou_losses.append(iou_loss)
             losses_by_layer.append((layer_id, dict(
                 center_loss=torch.sum(torch.stack(center_losses)),
                 size_loss=torch.sum(torch.stack(size_losses)),
+                yaw_loss=torch.sum(torch.stack(yaw_losses)),
                 cls_loss=torch.sum(torch.stack(cls_losses)),
-                giou_loss=torch.sum(torch.stack(giou_losses)))))
+                iou_loss=torch.sum(torch.stack(iou_losses)))))
 
         loss_dict = {}
         main_layer_id = layer_ids[-1]
@@ -334,22 +378,25 @@ class ReconDetHead(BaseModule):
 
     def _loss_by_feat_single(self, center_pred, size_pred,
                              size_residual_pred, size_reference_log,
-                             size_log_pred, cls_pred, input_meta,
+                             size_log_pred, yaw_pred, cls_pred, input_meta,
                              gt_bboxes, gt_labels, input_points,
-                             match_indices=None, avg_factor=None):
+                             match_indices=None, avg_factor=None,
+                             scene_bounds=None):
         del input_meta, input_points
         centers = center_pred.t()
         sizes = size_pred.t()
         size_residuals = size_residual_pred.t()
         size_reference_logs = size_reference_log.t()
         size_logs = size_log_pred.t()
+        yaw_vectors = yaw_pred.t()
         cls_scores = cls_pred.t()
         gt_centers = gt_bboxes.gravity_center
         gt_sizes = gt_bboxes.tensor[:, 3:6].clamp_min(1e-5)
         if match_indices is None:
             pred_indices, gt_indices = self.matcher._get_targets(
-                centers, sizes, size_logs, cls_scores,
-                gt_centers, gt_sizes, gt_labels)
+                centers, sizes, size_logs, yaw_vectors, cls_scores,
+                gt_centers, gt_sizes, gt_bboxes.tensor[:, 6], gt_labels,
+                center_range=scene_bounds)
         else:
             pred_indices, gt_indices = match_indices
         if avg_factor is None:
@@ -371,10 +418,18 @@ class ReconDetHead(BaseModule):
         size_loss = size_loss * self.loss_weights['size_loss']
         if pred_indices.numel() == 0:
             center_loss = centers.sum() * 0.0
-            giou_loss = sizes.sum() * 0.0
+            yaw_loss = yaw_vectors.sum() * 0.0
+            iou_loss = sizes.sum() * 0.0
         else:
-            center_min = self.matcher.center_min.to(centers)
-            center_extent = self.matcher.center_extent.to(centers)
+            if scene_bounds is None:
+                center_min = self.matcher.center_min.to(centers)
+                center_extent = self.matcher.center_extent.to(centers)
+            else:
+                bounds = torch.as_tensor(
+                    scene_bounds, device=centers.device,
+                    dtype=centers.dtype).reshape(2, 3)
+                center_min = bounds[0]
+                center_extent = bounds[1] - bounds[0]
             matched_centers = (
                 centers[pred_indices] - center_min) / center_extent
             matched_gt_centers = (
@@ -383,17 +438,24 @@ class ReconDetHead(BaseModule):
                 matched_centers, matched_gt_centers,
                 reduction='sum') / avg_factor
 
-            pred_tp_bbox = self._center_size_pred_to_bbox(
-                centers[pred_indices], sizes[pred_indices])
-            gt_tp_bbox = self._center_size_pred_to_bbox(
-                gt_centers[gt_indices], gt_sizes[gt_indices])
-            giou = axis_aligned_bbox_overlaps_3d(
-                pred_tp_bbox.unsqueeze(0), gt_tp_bbox.unsqueeze(0),
-                mode='giou', is_aligned=True)
-            giou_loss = (1.0 - giou).sum() / avg_factor
+            matched_yaw_vectors = yaw_vectors[pred_indices]
+            matched_gt_yaws = gt_bboxes.tensor[gt_indices, 6]
+            yaw_loss = periodic_yaw_loss(
+                matched_yaw_vectors, matched_gt_yaws,
+                reduction='sum') / avg_factor
+            pred_boxes = torch.cat((
+                centers[pred_indices], sizes[pred_indices],
+                decode_yaw(matched_yaw_vectors)[:, None]), dim=-1)
+            gt_boxes = torch.cat((
+                gt_centers[gt_indices], gt_sizes[gt_indices],
+                matched_gt_yaws[:, None]), dim=-1)
+            iou = diff_iou_rotated_3d(
+                pred_boxes.unsqueeze(0), gt_boxes.unsqueeze(0)).squeeze(0)
+            iou_loss = (1.0 - iou).sum() / avg_factor
         center_loss = center_loss * self.loss_weights['center_loss']
-        giou_loss = giou_loss * self.loss_weights['iou_loss']
-        return center_loss, size_loss, cls_loss, giou_loss
+        yaw_loss = yaw_loss * self.loss_weights['yaw_loss']
+        iou_loss = iou_loss * self.loss_weights['iou_loss']
+        return center_loss, size_loss, yaw_loss, cls_loss, iou_loss
 
     def predict(self,
                 x: Tuple[Tensor],
@@ -408,6 +470,7 @@ class ReconDetHead(BaseModule):
         predictions = self.predict_by_feat(
             [outputs['center_preds'][-1]],
             [outputs['size_preds'][-1]],
+            [outputs['yaw_preds'][-1]],
             [outputs['cls_preds'][-1]],
             batch_input_metas=batch_input_metas,
             rescale=rescale, batch_inputs_dict=batch_inputs_dict, batch_data_samples=batch_data_samples)
@@ -415,6 +478,7 @@ class ReconDetHead(BaseModule):
 
     def predict_by_feat(self, center_preds: List[List[Tensor]],
                         size_preds: List[List[Tensor]],
+                        yaw_preds: List[List[Tensor]],
                         cls_preds: List[List[Tensor]],
                         batch_input_metas: List[dict], batch_inputs_dict: dict, batch_data_samples,
                         **kwargs) -> List[InstanceData]:
@@ -429,19 +493,23 @@ class ReconDetHead(BaseModule):
                 self._predict_by_feat_single(
                     center_preds=[x[i] for x in center_preds],
                     size_preds=[x[i] for x in size_preds],
+                    yaw_preds=[x[i] for x in yaw_preds],
                     cls_preds=[x[i] for x in cls_preds],
                     input_meta=batch_input_metas[i],
                     input_points=batch_input_points[i],
                     data_samples=batch_data_samples[i]))
         return results
 
-    def _predict_by_feat_single(self, center_preds, size_preds, cls_preds,
+    def _predict_by_feat_single(self, center_preds, size_preds, yaw_preds,
+                                cls_preds,
                                 input_meta: dict, input_points, data_samples) -> InstanceData:
 
         mlvl_bboxes, mlvl_scores = [], []
         for stage_idx in range(len(center_preds)):
-            centers, sizes, cls_scores = center_preds[stage_idx].t(), size_preds[stage_idx].t(), cls_preds[
-                stage_idx].t()
+            centers = center_preds[stage_idx].t()
+            sizes = size_preds[stage_idx].t()
+            yaw_vectors = yaw_preds[stage_idx].t()
+            cls_scores = cls_preds[stage_idx].t()
             scores = cls_scores.sigmoid()
 
             max_scores, _ = scores.max(dim=1)
@@ -450,18 +518,20 @@ class ReconDetHead(BaseModule):
                 _, ids = max_scores.topk(self.test_cfg.nms_pre)
                 centers = centers[ids]
                 sizes = sizes[ids]
+                yaw_vectors = yaw_vectors[ids]
                 scores = scores[ids]
-            bboxes = self._center_size_pred_to_bbox(centers, sizes)
+            bboxes = torch.cat((
+                centers, sizes, decode_yaw(yaw_vectors)[:, None]), dim=-1)
             mlvl_bboxes.append(bboxes)
             mlvl_scores.append(scores)
 
         bboxes = torch.cat(mlvl_bboxes)
         scores = torch.cat(mlvl_scores)
-        bboxes_after_nms, scores, labels = self._nms(bboxes, scores,
-                                                     input_meta)  # bboxes(n_box, 6) (x_center, y_center, z_center, w, h, z)
+        bboxes_after_nms, scores, labels = self._nms(bboxes, scores)
 
         bboxes = input_meta['box_type_3d'](
-            bboxes_after_nms, box_dim=6, with_yaw=False, origin=(.5, .5, .5))
+            bboxes_after_nms, box_dim=7, with_yaw=True,
+            origin=(.5, .5, .5))
 
         results = InstanceData()
         results.bboxes_3d = bboxes
@@ -486,22 +556,32 @@ class ReconDetHead(BaseModule):
             centers[:, 1] + sizes[:, 1] / 2.0, centers[:, 2] + sizes[:, 2] / 2.0
         ], -1)
 
-    def _nms(self, bboxes, scores, img_meta):  # bbox is 6-dim. (x_min, y_min, z_min, x_max, y_max, z_max)
-        scores, labels = scores.max(dim=1)
-        ids = scores > self.test_cfg.score_thr
-        bboxes = bboxes[ids]
-        scores = scores[ids]
-        labels = labels[ids]
-        ids = self.aligned_3d_nms(bboxes, scores, labels,
-                                  self.test_cfg.iou_thr)
-        bboxes = bboxes[ids]
-        bboxes = torch.stack(
-            ((bboxes[:, 0] + bboxes[:, 3]) / 2.,
-             (bboxes[:, 1] + bboxes[:, 4]) / 2.,
-             (bboxes[:, 2] + bboxes[:, 5]) / 2., bboxes[:, 3] - bboxes[:, 0],
-             bboxes[:, 4] - bboxes[:, 1], bboxes[:, 5] - bboxes[:, 2]),
-            dim=1)  # (convert to (x_center, y_center, z_center, w, h, z))
-        return bboxes, scores[ids], labels[ids]
+    def _nms(self, bboxes, scores):
+        kept_boxes = []
+        kept_scores = []
+        kept_labels = []
+        for class_id in range(scores.shape[1]):
+            class_scores = scores[:, class_id]
+            candidates = torch.nonzero(
+                class_scores > self.test_cfg.score_thr,
+                as_tuple=False).flatten()
+            if candidates.numel() == 0:
+                continue
+            class_keep = nms3d(
+                bboxes[candidates], class_scores[candidates],
+                self.test_cfg.iou_thr)
+            kept_boxes.append(bboxes[candidates[class_keep]])
+            kept_scores.append(class_scores[candidates[class_keep]])
+            kept_labels.append(torch.full_like(
+                class_keep, class_id, dtype=torch.long))
+        if not kept_boxes:
+            return (bboxes.new_empty((0, 7)), scores.new_empty((0,)),
+                    torch.empty(0, device=scores.device, dtype=torch.long))
+        bboxes = torch.cat(kept_boxes)
+        scores = torch.cat(kept_scores)
+        labels = torch.cat(kept_labels)
+        order = scores.argsort(descending=True)
+        return bboxes[order], scores[order], labels[order]
 
     @staticmethod
     def aligned_3d_nms(boxes, scores, classes, thresh):

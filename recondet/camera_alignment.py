@@ -39,7 +39,7 @@ def _homogeneous_extrinsics(extrinsics):
 
 
 def _gt_inverse_components(reference, first_frame_pose, axis_align_matrix,
-                           scene_scale):
+                           scene_scale, vggt_extrinsics=None):
     batch_size = reference.shape[0]
     first_frame_pose = _batch_matrix(
         first_frame_pose, reference, batch_size, 'first_frame_pose')
@@ -57,19 +57,30 @@ def _gt_inverse_components(reference, first_frame_pose, axis_align_matrix,
             batch_size, 1, 1)
     scale_matrix[:, :3, :3] *= scene_scale[:, None, None]
     first_c2w_aligned = torch.bmm(axis_align_matrix, first_frame_pose)
-    normalized_to_aligned = torch.bmm(first_c2w_aligned, scale_matrix)
+    if vggt_extrinsics is None:
+        first_vggt_w2c = torch.eye(
+            4, device=reference.device, dtype=torch.float32).repeat(
+                batch_size, 1, 1)
+    else:
+        vggt_extrinsics = _homogeneous_extrinsics(vggt_extrinsics)
+        if vggt_extrinsics.shape[0] != batch_size:
+            raise ValueError('VGGT cameras and points must share B')
+        first_vggt_w2c = vggt_extrinsics[:, 0]
+    normalized_to_aligned = torch.bmm(
+        first_c2w_aligned, torch.bmm(scale_matrix, first_vggt_w2c))
     return scale_matrix, normalized_to_aligned, scene_scale
 
 
 @torch.no_grad()
 def denormalize_vggt_gt_points(points, first_frame_pose, axis_align_matrix,
-                               scene_scale):
+                               scene_scale, vggt_extrinsics=None):
     """Invert BuildVGGTGroundTruth's first-camera point normalization."""
     if points.ndim != 4 or points.shape[-1] != 3:
         raise ValueError('points must have shape [B, V, Q, 3]')
     with torch.autocast(device_type=points.device.type, enabled=False):
         _, normalized_to_aligned, _ = _gt_inverse_components(
-            points, first_frame_pose, axis_align_matrix, scene_scale)
+            points, first_frame_pose, axis_align_matrix, scene_scale,
+            vggt_extrinsics)
         aligned_points = torch.einsum(
             'bij,bvqj->bvqi', normalized_to_aligned[:, :3, :3],
             points.float())
@@ -85,7 +96,8 @@ def denormalize_vggt_gt_cameras(extrinsics, first_frame_pose,
     extrinsics_h = _homogeneous_extrinsics(extrinsics)
     with torch.autocast(device_type=extrinsics.device.type, enabled=False):
         scale_matrix, normalized_to_aligned, _ = _gt_inverse_components(
-            extrinsics_h, first_frame_pose, axis_align_matrix, scene_scale)
+            extrinsics_h, first_frame_pose, axis_align_matrix, scene_scale,
+            extrinsics_h)
         metric_camera_extrinsics = torch.matmul(
             scale_matrix[:, None], extrinsics_h)
         aligned_extrinsics = torch.matmul(
@@ -304,17 +316,42 @@ def load_axis_aligned_points(path, num_point_features, axis_align_matrix):
             axis_align_matrix[:3, 3])
 
 
+def robust_scene_bounds(points, quantiles=(0.01, 0.99), margin_ratio=0.05,
+                        min_extent=0.5):
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError('Point cloud must have shape [N, 3]')
+    points = points[np.isfinite(points).all(axis=1)]
+    if len(points) == 0:
+        raise ValueError('Point cloud has no finite points')
+    lower_q, upper_q = map(float, quantiles)
+    if not 0 <= lower_q < upper_q <= 1:
+        raise ValueError('quantiles must be increasing values in [0, 1]')
+    if margin_ratio < 0 or min_extent <= 0:
+        raise ValueError('margin_ratio and min_extent must be valid')
+    lower, upper = np.quantile(points, [lower_q, upper_q], axis=0)
+    center = (lower + upper) * 0.5
+    extent = np.maximum(upper - lower, float(min_extent))
+    half_extent = extent * (0.5 + float(margin_ratio))
+    return np.stack([center - half_extent, center + half_extent]).astype(
+        np.float32)
+
+
 def normalize_query_points(query_xyz, query_xyz_range, eps=1e-5):
-    query_range = query_xyz.new_tensor(query_xyz_range, dtype=torch.float32)
-    if query_range.numel() != 6:
-        raise ValueError('query_xyz_range must contain 6 values')
-    query_range = query_range.reshape(2, 3)
+    query_range = torch.as_tensor(
+        query_xyz_range, device=query_xyz.device, dtype=torch.float32)
+    if query_range.numel() == 6 and query_range.ndim <= 2:
+        query_range = query_range.reshape(1, 2, 3).expand(
+            query_xyz.shape[0], -1, -1)
+    elif query_range.shape != (query_xyz.shape[0], 2, 3):
+        raise ValueError(
+            'query_xyz_range must have shape [6], [2, 3], or [B, 2, 3]')
     if not torch.isfinite(query_range).all():
         raise ValueError('query_xyz_range must be finite')
-    if (query_range[1] <= query_range[0]).any():
+    if (query_range[:, 1] <= query_range[:, 0]).any():
         raise ValueError('query_xyz_range maximums must exceed minimums')
-    reference_min = query_range[0].unsqueeze(0).expand(query_xyz.shape[0], -1)
-    reference_max = query_range[1].unsqueeze(0).expand(query_xyz.shape[0], -1)
+    reference_min = query_range[:, 0]
+    reference_max = query_range[:, 1]
     references = ((query_xyz.float() - reference_min[:, None]) /
                   (reference_max - reference_min)[:, None])
     return references.clamp(eps, 1.0 - eps), reference_min, reference_max

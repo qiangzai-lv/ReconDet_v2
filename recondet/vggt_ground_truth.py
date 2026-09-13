@@ -5,6 +5,7 @@ import numpy as np
 from mmcv.transforms import BaseTransform
 
 from mmdet3d.registry import TRANSFORMS
+from .camera_alignment import robust_scene_bounds
 
 
 def as_homogeneous(matrix, name='matrix'):
@@ -153,6 +154,7 @@ def build_vggt_ground_truth(raw_points, axis_align_matrix, selected_c2w,
 
     return {
         'gt_scene_points_aligned': points_aligned.astype(np.float32),
+        'scene_bounds': robust_scene_bounds(points_aligned),
         'gt_scene_points_vggt': points_vggt,
         'gt_depths_vggt': depths_vggt,
         'gt_depth_valid_masks': valid_depth,
@@ -180,7 +182,10 @@ class BuildVGGTGroundTruth(BaseTransform):
             if not image_paths:
                 raise ValueError('Cannot determine scene id for VGGT GT')
             scene_id = Path(image_paths[0]).parent.name
-        point_path = self.points_root / f'{scene_id}.bin'
+        point_path = Path(results.get(
+            'lidar_path', self.points_root / f'{scene_id}.bin'))
+        if not point_path.is_absolute():
+            point_path = self.points_root / point_path.name
         raw = np.fromfile(point_path, dtype=np.float32)
         if raw.size == 0 or raw.size % self.num_point_features:
             raise ValueError(f'Unexpected point cloud shape in {point_path}')

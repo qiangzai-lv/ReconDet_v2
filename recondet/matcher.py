@@ -1,6 +1,7 @@
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
+from mmcv.ops import diff_iou_rotated_3d
 
 from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
 
@@ -53,7 +54,7 @@ def _build_cost_matrix(all_centers, all_sizes, all_cls, all_objness,
 
 
 class RepeatedHungarianMatcher(nn.Module):
-    """Hungarian matcher with repeated GTs and explicit log-size cost."""
+    """Repeated-GT matcher for periodic oriented indoor boxes."""
 
     def __init__(self,
                  cost_weights=None,
@@ -63,8 +64,9 @@ class RepeatedHungarianMatcher(nn.Module):
                  focal_gamma=2.0):
         super().__init__()
         if cost_weights is None:
-            cost_weights = dict(cls=2.0, center=1.0, size=1.0, giou=2.0)
-        required = {'cls', 'center', 'size', 'giou'}
+            cost_weights = dict(
+                cls=2.0, center=1.0, size=1.0, yaw=1.0, iou=2.0)
+        required = {'cls', 'center', 'size', 'yaw', 'iou'}
         if set(cost_weights) != required:
             raise ValueError(f'cost_weights must contain exactly {required}')
         if gt_repeat_num < 1:
@@ -94,13 +96,28 @@ class RepeatedHungarianMatcher(nn.Module):
         return positive[:, gt_labels] - negative[:, gt_labels]
 
     @staticmethod
-    def _center_size_pred_to_bbox(centers, sizes):
-        half_size = sizes / 2.0
-        return torch.cat((centers - half_size, centers + half_size), dim=-1)
+    def _normalize_yaw_vectors(vectors):
+        return torch.nn.functional.normalize(vectors, dim=-1, eps=1e-6)
+
+    @classmethod
+    def _decode_yaw(cls, vectors):
+        vectors = cls._normalize_yaw_vectors(vectors)
+        return 0.5 * torch.atan2(vectors[..., 0], vectors[..., 1])
+
+    @staticmethod
+    def _pairwise_rotated_iou(pred_boxes, gt_boxes):
+        num_pred, num_gt = len(pred_boxes), len(gt_boxes)
+        pred_pairs = pred_boxes[:, None].expand(-1, num_gt, -1).reshape(
+            1, -1, 7)
+        gt_pairs = gt_boxes[None].expand(num_pred, -1, -1).reshape(
+            1, -1, 7)
+        return diff_iou_rotated_3d(pred_pairs, gt_pairs).reshape(
+            num_pred, num_gt)
 
     @torch.no_grad()
     def _get_targets(self, pred_centers, pred_sizes, pred_size_logs,
-                     pred_logits, gt_centers, gt_sizes, gt_labels):
+                     pred_yaw_vectors, pred_logits, gt_centers, gt_sizes,
+                     gt_yaws, gt_labels, center_range=None):
         num_queries = pred_centers.shape[0]
         num_gt = gt_centers.shape[0]
         empty = torch.empty(0, dtype=torch.long, device=pred_centers.device)
@@ -111,9 +128,11 @@ class RepeatedHungarianMatcher(nn.Module):
                 ('predicted centers', pred_centers),
                 ('predicted sizes', pred_sizes),
                 ('predicted log sizes', pred_size_logs),
+                ('predicted yaw vectors', pred_yaw_vectors),
                 ('classification logits', pred_logits),
                 ('ground-truth centers', gt_centers),
-                ('ground-truth sizes', gt_sizes)):
+                ('ground-truth sizes', gt_sizes),
+                ('ground-truth yaws', gt_yaws)):
             _ensure_finite(name, value)
         if (pred_sizes <= 0).any() or (gt_sizes <= 0).any():
             raise ValueError('predicted and ground-truth sizes must be positive')
@@ -122,6 +141,8 @@ class RepeatedHungarianMatcher(nn.Module):
         pred_centers = pred_centers.float()
         pred_sizes = pred_sizes.float()
         pred_size_logs = pred_size_logs.float()
+        pred_yaw_vectors = self._normalize_yaw_vectors(
+            pred_yaw_vectors.float())
         pred_logits = pred_logits.float()
         gt_centers = gt_centers.float()
         gt_sizes = gt_sizes.float()
@@ -132,9 +153,20 @@ class RepeatedHungarianMatcher(nn.Module):
         repeated_centers = gt_centers[repeated_gt_indices]
         repeated_sizes = gt_sizes[repeated_gt_indices]
         repeated_labels = gt_labels[repeated_gt_indices]
+        repeated_yaws = gt_yaws.float()[repeated_gt_indices]
 
-        center_min = self.center_min.to(pred_centers)
-        center_extent = self.center_extent.to(pred_centers)
+        if center_range is None:
+            center_min = self.center_min.to(pred_centers)
+            center_extent = self.center_extent.to(pred_centers)
+        else:
+            center_range = torch.as_tensor(
+                center_range, device=pred_centers.device,
+                dtype=pred_centers.dtype).reshape(2, 3)
+            _ensure_finite('scene center range', center_range)
+            center_min = center_range[0]
+            center_extent = center_range[1] - center_range[0]
+            if (center_extent <= 0).any():
+                raise ValueError('scene center range must be increasing')
         pred_centers_normalized = (pred_centers - center_min) / center_extent
         gt_centers_normalized = (repeated_centers - center_min) / center_extent
         cost_center = torch.cdist(
@@ -142,18 +174,25 @@ class RepeatedHungarianMatcher(nn.Module):
         cost_size = torch.cdist(
             pred_size_logs, repeated_sizes.clamp_min(1e-5).log(), p=1)
         cost_class = self._focal_cost(pred_logits, repeated_labels)
-
-        pred_boxes = self._center_size_pred_to_bbox(pred_centers, pred_sizes)
-        gt_boxes = self._center_size_pred_to_bbox(
-            repeated_centers, repeated_sizes)
-        giou = axis_aligned_bbox_overlaps_3d(
-            pred_boxes.unsqueeze(0), gt_boxes.unsqueeze(0),
-            mode='giou').squeeze(0)
+        repeated_yaw_vectors = torch.stack(
+            (torch.sin(2.0 * repeated_yaws),
+             torch.cos(2.0 * repeated_yaws)), dim=-1)
+        cost_yaw = torch.cdist(
+            pred_yaw_vectors, repeated_yaw_vectors, p=1)
         total_cost = (
             self.cost_weights['cls'] * cost_class
             + self.cost_weights['center'] * cost_center
             + self.cost_weights['size'] * cost_size
-            - self.cost_weights['giou'] * giou)
+            + self.cost_weights['yaw'] * cost_yaw)
+        if self.cost_weights['iou']:
+            pred_boxes = torch.cat((
+                pred_centers, pred_sizes,
+                self._decode_yaw(pred_yaw_vectors)[:, None]), dim=-1)
+            gt_boxes = torch.cat((
+                repeated_centers, repeated_sizes,
+                repeated_yaws[:, None]), dim=-1)
+            rotated_iou = self._pairwise_rotated_iou(pred_boxes, gt_boxes)
+            total_cost = total_cost - self.cost_weights['iou'] * rotated_iou
         _ensure_finite('Hungarian cost matrix', total_cost)
 
         pred_indices, repeated_indices = linear_sum_assignment(

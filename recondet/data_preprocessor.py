@@ -22,7 +22,7 @@ class ReconDetDataPreprocessor(DetDataPreprocessor):
     VGGT_GT_INPUT_KEYS = (
         'gt_depths_vggt', 'gt_depth_valid_masks',
         'gt_scene_points_vggt', 'gt_extrinsics_vggt',
-        'gt_c2w_vggt', 'gt_intrinsics', 'vggt_gt_scale')
+        'gt_c2w_vggt', 'gt_intrinsics', 'vggt_gt_scale', 'scene_bounds')
 
     def __init__(self,
                  batch_first: bool = True,

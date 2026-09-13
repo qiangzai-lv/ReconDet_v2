@@ -21,34 +21,24 @@ def camera_intrinsic_for_view(value, view_index):
     return matrices[:3, :3].copy()
 
 
-def read_pose_matrix(file_path):
-
-    try:
-        with open(file_path, 'r') as file:
-            lines = file.readlines()
-
-        matrix = [list(map(float, line.strip().split())) for line in lines]
-
-        pose_matrix = np.array(matrix)
-
-        if pose_matrix.shape != (4, 4):
-            raise ValueError("The input file does not contain a valid 4x4 pose matrix.")
-
-        return pose_matrix
-
-    except Exception as e:
-        print(f"Error reading pose matrix: {e}")
-        return None
+def arkit_pose_path(image_path):
+    image_path = Path(image_path)
+    suffix = '_color.png'
+    if not image_path.name.endswith(suffix):
+        raise ValueError(f'Unexpected ARKit color image name: {image_path}')
+    return image_path.with_name(image_path.name[:-len(suffix)] + '_pose.npy')
 
 
 @TRANSFORMS.register_module()
 class LoadFirstFramePose(BaseTransform):
     def transform(self, results: dict) -> dict:
         first_img_path = results['img_path'][0]
-        pose_matrix = read_pose_matrix(str(Path(first_img_path).with_suffix('.txt')))
-        if pose_matrix is None:
-            raise ValueError(f'Could not load first-frame pose for {first_img_path}')
-
+        pose_path = arkit_pose_path(first_img_path)
+        if not pose_path.is_file():
+            raise FileNotFoundError(f'ARKit pose does not exist: {pose_path}')
+        pose_matrix = np.load(pose_path)
+        if pose_matrix.shape != (4, 4) or not np.isfinite(pose_matrix).all():
+            raise ValueError(f'Invalid ARKit pose matrix: {pose_path}')
         results['pose_matrix'] = pose_matrix.astype(np.float32)
         return results
 
@@ -74,21 +64,38 @@ class MultiViewPipeline(BaseTransform):
             raise ValueError('depth_scale must be finite and positive')
         self.depth_scale = float(depth_scale)
 
-    def _select_view_indices(self, num_views: int) -> np.ndarray:
+    def _select_view_indices(self, num_views: int,
+                             available_view_indices=None) -> np.ndarray:
         if num_views <= 0:
             raise ValueError('A scene must contain at least one image')
 
+        candidates = np.arange(num_views, dtype=np.int64)
+        if available_view_indices is not None:
+            available = np.asarray(available_view_indices)
+            if available.dtype == np.bool_:
+                if available.shape != (num_views,):
+                    raise ValueError('available-view mask must have shape [V]')
+                candidates = np.flatnonzero(available)
+            else:
+                candidates = available.astype(np.int64).reshape(-1)
+            if len(candidates) == 0:
+                raise ValueError('No available views can be selected')
+            if (candidates < 0).any() or (candidates >= num_views).any():
+                raise ValueError('available view index is out of range')
+
         if self.loading == 'random':
             return np.random.choice(
-                num_views,
+                candidates,
                 self.n_images,
-                replace=self.n_images > num_views)
+                replace=self.n_images > len(candidates))
 
-        return np.rint(
-            np.linspace(0, num_views - 1, self.n_images)).astype(np.int64)
+        positions = np.rint(np.linspace(
+            0, len(candidates) - 1, self.n_images)).astype(np.int64)
+        return candidates[positions]
 
     def transform(self, results: dict) -> dict:
-        ids = self._select_view_indices(len(results['img_info']))
+        ids = self._select_view_indices(
+            len(results['img_info']), results.get('available_view_indices'))
         imgs = []
         extrinsics = []
         src_img_paths = []

@@ -382,6 +382,8 @@ class MultiViewARKitDataset(Det3DDataset):
     def __init__(self,
                  data_root: str,
                  ann_file: str,
+                 ann_file_2d: str,
+                 restrict_to_2d_views: bool = True,
                  metainfo: Optional[dict] = None,
                  pipeline: List[Union[dict, Callable]] = [],
                  modality: dict = dict(use_camera=True, use_lidar=False),
@@ -392,6 +394,12 @@ class MultiViewARKitDataset(Det3DDataset):
                  **kwargs) -> None:
 
         self.remove_dontcare = remove_dontcare
+        self.restrict_to_2d_views = bool(restrict_to_2d_views)
+        annotation_path = Path(ann_file_2d)
+        if not annotation_path.is_absolute():
+            annotation_path = Path(data_root) / annotation_path
+        self._2d_annotation_index = load_scannet_2d_annotation_index(
+            annotation_path, data_root)
 
         super().__init__(
             data_root=data_root,
@@ -410,35 +418,23 @@ class MultiViewARKitDataset(Det3DDataset):
 
     @staticmethod
     def _get_axis_align_matrix(info: dict) -> np.ndarray:
-        """Get axis_align_matrix from info. If not exist, return identity mat.
-
-        Args:
-            info (dict): Info of a single sample data.
-
-        Returns:
-            np.ndarray: 4x4 transformation matrix.
-        """
         if 'axis_align_matrix' in info:
-            return np.array(info['axis_align_matrix']) # identiy
-        else:
-            warnings.warn(
-                'axis_align_matrix is not found in ScanNet data info, please '
-                'use new pre-process scripts to re-generate ScanNet data')
-            return np.eye(4).astype(np.float32)
+            matrix = np.asarray(info['axis_align_matrix'], dtype=np.float32)
+            if matrix.shape != (4, 4):
+                raise ValueError('axis_align_matrix must have shape [4, 4]')
+            return matrix
+        return np.eye(4, dtype=np.float32)
 
     def parse_data_info(self, info: dict) -> dict:
-        """Process the raw data info.
+        lidar_record = info.get('lidar_points', {})
+        lidar_name = lidar_record.get('lidar_path')
+        if not lidar_name:
+            raise ValueError('ARKit data info requires lidar_points.lidar_path')
+        scene_id = Path(lidar_name).stem
+        info['scene_id'] = scene_id
+        info['lidar_path'] = str(Path(self.data_root) / 'points' / lidar_name)
+        info['num_pts_feats'] = int(lidar_record.get('num_pts_feats', 6))
 
-        Convert all relative path of needed modality data file to
-        the absolute path.
-
-        Args:
-            info (dict): Raw info dict.
-
-        Returns:
-            dict: Has `ann_info` in training stage. And
-            all path has been converted to absolute path.
-        """
         if self.modality['use_depth']:
             info['depth_info'] = []
         if self.modality['use_neuralrecon_depth']:
@@ -451,6 +447,10 @@ class MultiViewARKitDataset(Det3DDataset):
                 '`MultiViewPipeline` to support lidar processing')
 
         info['axis_align_matrix'] = self._get_axis_align_matrix(info)
+        info['ann_info_2d'], annotated_views = self._parse_2d_annotations(info)
+        info['available_view_indices'] = (
+            annotated_views if self.restrict_to_2d_views
+            else np.arange(len(info['img_paths']), dtype=np.int64))
         info['img_info'] = []
         info['lidar2img'] = []
         intrinsics = []
@@ -464,20 +464,16 @@ class MultiViewARKitDataset(Det3DDataset):
                     info['depth_info'].append(
                         dict(filename=img_filename[:-4] + '.npy'))
                 else:
-                    info['depth_info'].append(
-                        dict(filename=osp.join(self.data_root, info['depth_paths'][i]))) # load depth from here
-                    assert info['img_paths'][i].split('/')[-1] == info['depth_paths'][i].split('/')[-1] #
-            # implement lidar_info in input.keys() in the future.
+                    info['depth_info'].append(dict(
+                        filename=osp.join(
+                            self.data_root, info['depth_paths'][i])))
             extrinsic = np.linalg.inv(
                 info['axis_align_matrix'] @ info['lidar2cam'][i])
-            info['lidar2img'].append(extrinsic.astype(np.float32)) # w2c
-            # intrisinc:
+            info['lidar2img'].append(extrinsic.astype(np.float32))
             intrinsic = info['cam2img'][i]
-            new_intrinsic = np.eye(4)
+            new_intrinsic = np.eye(4, dtype=np.float32)
             new_intrinsic[:3, :3] = intrinsic
-            intrinsics.append(new_intrinsic.astype(np.float32))
-            
-            
+            intrinsics.append(new_intrinsic)
         origin = np.array([.0, .0, .5])
         info['lidar2img'] = dict(
             extrinsic=info['lidar2img'],
@@ -492,15 +488,39 @@ class MultiViewARKitDataset(Det3DDataset):
 
         return info
 
+    def _parse_2d_annotations(self, info: dict) -> tuple:
+        index = self._2d_annotation_index
+        scene_id = info['scene_id']
+        classes = tuple(self.metainfo['classes'])
+        annotations_by_view = []
+        available = []
+        data_root = Path(self.data_root).resolve()
+        for view_index, image_path in enumerate(info['img_paths']):
+            image_key = _normalise_image_key(image_path, data_root)
+            image = index.images_by_view.get((scene_id, view_index))
+            records = index.by_image_key.get((scene_id, image_key))
+            if records is None and image is not None:
+                records = index.annotations_by_image_id[image['image_id']]
+            if records is None:
+                annotations_by_view.append([])
+                continue
+            available.append(view_index)
+            parsed_records = []
+            for record in records:
+                category_name = index.category_id_to_name.get(
+                    int(record['category_id']))
+                if category_name not in classes:
+                    raise ValueError(
+                        f'Unknown ARKit 2D category {category_name!r}')
+                parsed = dict(record)
+                parsed['bbox_label'] = classes.index(category_name)
+                parsed_records.append(parsed)
+            annotations_by_view.append(parsed_records)
+        if not available:
+            raise ValueError(f'No COCO-indexed views found for {scene_id}')
+        return annotations_by_view, np.asarray(available, dtype=np.int64)
+
     def parse_ann_info(self, info: dict) -> dict:
-        """Process the `instances` in data info to `ann_info`.
-
-        Args:
-            info (dict): Info dict.
-
-        Returns:
-            dict: Processed `ann_info`.
-        """
         ann_info = super().parse_ann_info(info)
 
         if self.remove_dontcare:
@@ -516,12 +536,11 @@ class MultiViewARKitDataset(Det3DDataset):
             ann_info['gt_bboxes_3d'],
             box_dim=ann_info['gt_bboxes_3d'].shape[-1],
             with_yaw=True,
-            origin=(0.5, 0.5, 0.5)).convert_to(self.box_mode_3d) # src mode is the same as tgt mode
+            origin=(0.5, 0.5, 0.5)).convert_to(self.box_mode_3d)
 
         # count the numbers
         for label in ann_info['gt_labels_3d']:
             if label != -1:
-                # cat_name = self.metainfo['classes'][label]
                 cat_name = label
                 self.num_ins_per_cat[cat_name] += 1
 

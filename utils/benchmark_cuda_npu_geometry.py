@@ -271,7 +271,7 @@ def _npu_bev_iou(torch, mx_driving, pred, gt):
 
 def _npu_pairwise(torch, mx_driving, pred, gt):
     bev_iou = _npu_bev_iou(torch, mx_driving, pred, gt)
-    batch, num_pred, num_gt = pred.shape[0], pred.shape[1], gt.shape[1]
+    num_pred, num_gt = pred.shape[1], gt.shape[1]
     # DrivingSDK runs on NPU and its minimum/maximum kernels do not reliably
     # broadcast [B,N,1] with [B,1,M]. Materialize the pairwise shape.
     pred_z_min = (pred[..., 2] - pred[..., 5] / 2).unsqueeze(-1).expand(
@@ -286,11 +286,15 @@ def _npu_pairwise(torch, mx_driving, pred, gt):
                - torch.maximum(pred_z_min, gt_z_min)).clamp_min(0)
     pred_area = (pred[..., 3] * pred[..., 4]).unsqueeze(-1).expand(
         -1, -1, num_gt).contiguous()
+    gt_area = (gt[..., 3] * gt[..., 4]).unsqueeze(-2).expand(
+        -1, num_pred, -1).contiguous()
     gt_volume = (gt[..., 3] * gt[..., 4] * gt[..., 5]).unsqueeze(-2).expand(
         -1, num_pred, -1).contiguous()
     pred_volume = (pred[..., 3] * pred[..., 4] * pred[..., 5]).unsqueeze(
         -1).expand(-1, -1, num_gt).contiguous()
-    inter_bev = bev_iou * pred_area
+    # IoU = intersection / (area_pred + area_gt - intersection). Recover the
+    # intersection rather than multiplying IoU by one box's area.
+    inter_bev = bev_iou * (pred_area + gt_area) / (1 + bev_iou).clamp_min(1e-8)
     intersection = inter_bev * overlap
     return intersection / (pred_volume + gt_volume - intersection).clamp_min(1e-8)
 
@@ -314,7 +318,10 @@ def _npu_matched(torch, mx_driving, pred, gt):
                                gt[..., 2] + gt[..., 5] / 2)
                  - torch.maximum(pred[..., 2] - pred[..., 5] / 2,
                                  gt[..., 2] - gt[..., 5] / 2)).clamp_min(0)
-    intersection = bev_iou * pred[..., 3] * pred[..., 4] * z_overlap
+    pred_area = pred[..., 3] * pred[..., 4]
+    gt_area = gt[..., 3] * gt[..., 4]
+    inter_bev = bev_iou * (pred_area + gt_area) / (1 + bev_iou).clamp_min(1e-8)
+    intersection = inter_bev * z_overlap
     volume_pred = pred[..., 3] * pred[..., 4] * pred[..., 5]
     volume_gt = gt[..., 3] * gt[..., 4] * gt[..., 5]
     return intersection / (volume_pred + volume_gt - intersection).clamp_min(1e-8)

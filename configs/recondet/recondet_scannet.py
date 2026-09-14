@@ -313,7 +313,7 @@ param_scheduler = [
 ]
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', save_best=['coco/bbox_mAP'], rule='greater', interval=1, max_keep_ckpts=4),
+    checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule='greater', interval=1, max_keep_ckpts=4),
     logger=dict(type='LoggerHook', interval=10)
 )
 

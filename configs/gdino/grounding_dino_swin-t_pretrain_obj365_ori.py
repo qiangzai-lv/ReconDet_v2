@@ -11,8 +11,9 @@ scannet_ann_root = '/root/shared-nvme/data/scannet_coco_v2/'
 lang_model_name = '/root/shared-nvme/data/pretrain/bert-base-uncased'
 
 model = dict(
+    freeze_modules=['language_model', 'backbone', 'neck', 'encoder'],
     type='GroundingDINO',
-    num_queries=900,
+    num_queries=64,
     with_box_refine=True,
     as_two_stage=True,
     data_preprocessor=dict(
@@ -110,7 +111,7 @@ model = dict(
         label_noise_scale=0.5,
         box_noise_scale=1.0,  # 0.4 for DN-DETR
         group_cfg=dict(dynamic=True, num_groups=None,
-                       num_dn_queries=100)),  # TODO: half num_dn_queries
+                       num_dn_queries=10)),  # TODO: half num_dn_queries
     # training and testing settings
     train_cfg=dict(
         assigner=dict(
@@ -167,7 +168,7 @@ metainfo = dict(classes=(
 backend_args = None
 
 train_dataloader = dict(
-    batch_size=4,
+    batch_size=12,
     num_workers=12,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
@@ -179,7 +180,7 @@ train_dataloader = dict(
         data_prefix=dict(img=''),
         metainfo=metainfo,
         return_classes=True,
-        filter_cfg=dict(filter_empty_gt=True),
+        filter_cfg=dict(filter_empty_gt=False),
         pipeline=train_pipeline,
         backend_args=backend_args))
 val_dataloader = dict(

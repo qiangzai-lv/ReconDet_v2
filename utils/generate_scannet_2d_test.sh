@@ -31,13 +31,13 @@ exec "${PYTHON_BIN}" utils/scannet_3d_to_coco_bbox.py \
   --depth-scale 1000 \
   --depth-window-radius 1 \
   --min-visible-points 3 \
-  --min-visible-ratio 0.2 \
+  --min-visible-ratio 0.05 \
   --bbox-padding 2 \
   --center-min-samples 3 \
   --center-window-fraction 0.1 \
   --center-window-min-size 2 \
   --center-window-max-size 6 \
-  --visualize \
-  --visualization-dir "${OUTPUT_ROOT}/val_visualizations" \
-  --visualization-max-images "${VISUALIZATION_MAX_IMAGES:--1}" \
+#  --visualize \
+#  --visualization-dir "${OUTPUT_ROOT}/val_visualizations" \
+#  --visualization-max-images "${VISUALIZATION_MAX_IMAGES:--1}" \
   --log-level INFO

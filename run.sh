@@ -3,7 +3,7 @@ bash tools/dist_train.sh configs/recondet/recondet_scannet.py 1
 
 bash tools_mmdet/dist_train.sh configs/gdino/grounding_dino_swin-t_pretrain_obj365_ori.py 1
 
-bash tools/dist_test.sh configs/recondet/recondet_scannet.py work_dirs/recondet_scannet/epoch_40.pth 1
+bash tools_mmdet/dist_test.sh configs/gdino/grounding_dino_swin-t_pretrain_obj365_ori.py /root/shared-nvme/code/Recondet_up/work_dirs/grounding_dino_swin-t_pretrain_obj365_ori/epoch_1.pth 1 --show-dir /root/shared-nvme/code/Recondet_up/vis
 
 python utils/scannet_3d_to_coco_bbox.py \
   --data-root /root/shared-nvme/data/ScanNet_processed_v2 \
@@ -52,7 +52,7 @@ python utils/add_scannet_3d_instance_metadata.py \
 PYTHON_BIN=/root/miniforge3/bin/python \
 MAX_PARALLEL=8 \
 SHARD_START=0 \
-SHARD_END=4 \
+SHARD_END=8 \
 SPLIT=train \
 bash tools/generate_scannet_2d_all_shards.sh
 

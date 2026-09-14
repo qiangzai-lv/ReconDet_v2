@@ -109,6 +109,7 @@ class VisualizationItem:
     instance_id: int
     visible_point_ratio: float
     category_id: int
+    visible: bool = True
 
 
 _PALETTE = (
@@ -659,13 +660,20 @@ def render_annotation_image(
     draw = ImageDraw.Draw(rendered)
     width, height = rendered.size
     for item in items:
-        color = _PALETTE[(int(item.category_id) - 1) % len(_PALETTE)]
+        color = (_PALETTE[(int(item.category_id) - 1) % len(_PALETTE)]
+                 if item.visible else (160, 160, 160))
         x, y, box_width, box_height = map(float, item.bbox_xywh)
-        x2 = min(float(width - 1), x + box_width)
-        y2 = min(float(height - 1), y + box_height)
+        x = max(0.0, min(float(width - 1), x))
+        y = max(0.0, min(float(height - 1), y))
+        x2 = max(x, min(float(width - 1), x + box_width))
+        y2 = max(y, min(float(height - 1), y + box_height))
+        if x2 <= x or y2 <= y:
+            continue
         draw.rectangle((x, y, x2, y2), outline=color, width=3)
         label = (f'{item.category_name} #{item.instance_id} '
                  f'visible={item.visible_point_ratio:.2f}')
+        if not item.visible:
+            label += ' rejected'
         text_box = draw.textbbox((0, 0), label)
         label_width = min(text_box[2] - text_box[0] + 6, width)
         label_height = text_box[3] - text_box[1] + 4
@@ -687,9 +695,12 @@ def _save_view_visualization(
         image = source_image.convert('RGB')
     items = [
         VisualizationItem(
-            result.bbox, result.category_name, result.instance_id,
-            result.visible_point_ratio, result.category_id)
-        for result in view.results.values() if result.bbox is not None
+            result.bbox if result.bbox is not None else result.amodal_bbox,
+            result.category_name, result.instance_id,
+            result.visible_point_ratio, result.category_id,
+            visible=result.bbox is not None)
+        for result in view.results.values()
+        if result.bbox is not None or result.amodal_bbox is not None
     ]
     output = visualization_root / scene_id / f'{relative.stem}_annotations.jpg'
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -39,10 +39,6 @@ class ReconGroundingDINO(GroundingDINO):
         if scene_query_exchange_cfg is not None:
             cfg = dict(scene_query_exchange_cfg)
             enabled = bool(cfg.pop('enabled', True))
-            self.scene_query_exchange_single_view_dropout = float(
-                cfg.pop('single_view_dropout', 0.0))
-            if not 0 <= self.scene_query_exchange_single_view_dropout <= 1:
-                raise ValueError('single_view_dropout must be between 0 and 1')
             if enabled:
                 self.scene_query_exchange = nn.ModuleList([
                     SceneQueryExchange(embed_dims=self.embed_dims, **cfg)
@@ -50,11 +46,8 @@ class ReconGroundingDINO(GroundingDINO):
                 ])
 
     def _exchange_detection_queries(self, query: Tensor, layer_id: int,
-                                    bypass: bool = False,
                                     num_views: int = None) -> Tensor:
         """Apply one scene-local block to the trailing detection queries."""
-        if self.scene_query_exchange is None or bypass:
-            return query
         if query.ndim != 3 or query.shape[1] < self.num_queries:
             raise ValueError('decoder query must have shape [V, Q_total, D]')
         if num_views is None:
@@ -191,10 +184,6 @@ class ReconGroundingDINO(GroundingDINO):
             if use_reconstruction else None)
         intermediate = []
         intermediate_reference_points = [reference_points]
-        bypass_scene_exchange = (
-            self.training
-            and torch.rand((), device=query.device)
-            < self.scene_query_exchange_single_view_dropout)
 
         for layer_id, layer in enumerate(self.decoder.layers):
             reference_points_input = reference_points[:, :, None] * torch.cat(
@@ -217,9 +206,8 @@ class ReconGroundingDINO(GroundingDINO):
                 text_attention_mask=text_attention_mask,
                 **kwargs)
             query = self._exchange_detection_queries(
-                query, layer_id, bypass=bool(bypass_scene_exchange),
+                query, layer_id,
                 num_views=num_views)
-
             bbox_delta = self.bbox_head.reg_branches[layer_id](query)
             new_reference_points = (
                 bbox_delta + inverse_sigmoid(

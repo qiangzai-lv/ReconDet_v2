@@ -69,7 +69,6 @@ model = dict(
         enabled=True,
         num_heads=8,
         ffn_dims=1024,
-        dropout=0.1,
         residual_init=1e-3,
         single_view_dropout=0.0),
     reconstruction_depth_loss_weight=5.0,

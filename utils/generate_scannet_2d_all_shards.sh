@@ -84,7 +84,7 @@ if [[ "${SPLIT}" == "train" || "${SPLIT}" == "all" ]]; then
     "${DATA_ROOT}/scannet_infos_train_mvod_with_ids.pkl"
   run_split \
     train \
-    tools/generate_scannet_2d_train.sh \
+    utils/generate_scannet_2d_train.sh \
     "${OUTPUT_ROOT}/keypoints_bbox_train_scenes"
 fi
 
@@ -94,6 +94,6 @@ if [[ "${SPLIT}" == "test" || "${SPLIT}" == "all" ]]; then
     "${DATA_ROOT}/scannet_infos_val_mvod_with_ids.pkl"
   run_split \
     test \
-    tools/generate_scannet_2d_test.sh \
+    utils/generate_scannet_2d_test.sh \
     "${OUTPUT_ROOT}/keypoints_bbox_val_scenes"
 fi

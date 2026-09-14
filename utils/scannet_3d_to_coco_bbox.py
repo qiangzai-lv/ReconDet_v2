@@ -774,6 +774,7 @@ def convert(args: argparse.Namespace) -> None:
     categories = sorted(
         payload['metainfo']['categories'].items(), key=lambda item: item[1])
     category_by_label = {int(label): name for name, label in categories}
+    print("min_visible_ratio-----------:", args.min_visible_ratio)
     config = GeneratorConfig(
         depth_scale=args.depth_scale,
         abs_depth_tolerance=args.abs_depth_tolerance,

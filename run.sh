@@ -54,7 +54,7 @@ MAX_PARALLEL=8 \
 SHARD_START=0 \
 SHARD_END=8 \
 SPLIT=train \
-bash tools/generate_scannet_2d_all_shards.sh
+bash utils/generate_scannet_2d_all_shards.sh
 
 
 PYTHON_BIN=/root/miniforge3/bin/python \

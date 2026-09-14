@@ -6,6 +6,29 @@ from mmdet3d.registry import METRICS
 class SceneCocoMetric(CocoMetric):
     """Collect one record per scene before expanding views after DDP gather."""
 
+    @staticmethod
+    def _aggregate_similarity_stats(results):
+        results = [
+            result for result in results
+            if result.get('similarity_stats') is not None]
+        if not results:
+            return {}
+        totals = {
+            name: sum(float(result['similarity_stats'][name])
+                      for result in results)
+            for name in (
+                'positive_similarity_sum', 'positive_pair_count',
+                'negative_similarity_sum', 'negative_pair_count')
+        }
+        return {
+            'positive_similarity': (
+                totals['positive_similarity_sum'] /
+                max(totals['positive_pair_count'], 1.0)),
+            'negative_similarity': (
+                totals['negative_similarity_sum'] /
+                max(totals['negative_pair_count'], 1.0)),
+        }
+
     def process(self, data_batch, data_samples):
         for scene in data_samples:
             predictions = scene['pred_instances_2d']
@@ -29,15 +52,23 @@ class SceneCocoMetric(CocoMetric):
                     key: pred[key].detach().cpu().numpy()
                     for key in ('bboxes', 'scores', 'labels')})
                 records.append((gt, result))
-            self.results.append(records)
+            stats = scene.get('instance_similarity_stats')
+            if stats is not None:
+                stats = {name: float(value) for name, value in stats.items()}
+            self.results.append(dict(
+                records=records, similarity_stats=stats))
 
     def compute_metrics(self, results):
         unique = {}
         for scene in results:
-            for gt, pred in scene:
+            records = scene.get('records', scene)
+            for gt, pred in records:
                 unique.setdefault(gt['img_id'], (gt, pred))
         if not unique:
             raise ValueError('No sampled images to evaluate')
         # Reset every evaluation: a previous epoch must not retain its subset.
         self.img_ids = sorted(unique)
-        return super().compute_metrics([unique[i] for i in self.img_ids])
+        metrics = super().compute_metrics(
+            [unique[i] for i in self.img_ids])
+        metrics.update(self._aggregate_similarity_stats(results))
+        return metrics

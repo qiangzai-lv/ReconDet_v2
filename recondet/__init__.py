@@ -6,6 +6,7 @@ from .vggt_ground_truth import BuildVGGTGroundTruth
 from .recondet import ReconDet
 from .recondet_head import ReconDetHead
 from .grounding_dino_head import ReconGroundingDINOHead
+from .scene_coco_metric import SceneCocoMetric
 
 from .recon_grounding_dino import ReconGroundingDINO
 
@@ -16,4 +17,5 @@ __all__ = [
     'PackNeRFDetInputs',
     'ReconDetDataPreprocessor', 'ReconDetHead', 'ReconGroundingDINO',
     'ReconGroundingDINOHead',
+    'SceneCocoMetric',
 ]

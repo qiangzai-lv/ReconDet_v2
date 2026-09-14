@@ -16,9 +16,7 @@ gt_points_dir = f'{data_root}/points'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
 
 grounding_dino_config = 'configs/gdino/grounding_dino_swin-t_pretrain_obj365.py'
-grounding_dino_checkpoint = (
-    '/root/shared-nvme/code/Recondet_V4/work_dirs/recondet_scannet/'
-    'best_coco_bbox_mAP_epoch_8.pth')
+grounding_dino_checkpoint = '/root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'
 grounding_dino_classes = [
     'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
     'picture', 'counter', 'desk', 'curtain', 'refrigerator', 'shower curtain',
@@ -65,12 +63,22 @@ model = dict(
         min_cluster_size=0.05),
     query_xyz_range=_query_xyz_range_,
     gt_points_dir=gt_points_dir,
+    supervise_2d_bbox=True,
+    train_2d_only=True,
+    supervise_instance_consistency=True,
+    instance_consistency_cfg=dict(
+        embedding_dims=128,
+        temperature=0.1,
+        loss_weight=0.1,
+        background_max_iou=0.3,
+        background_ratio=2.0,
+        min_background=8,
+        max_background=32),
     scene_query_exchange_cfg=dict(
         enabled=True,
         num_heads=8,
         ffn_dims=1024,
-        residual_init=1e-3,
-        single_view_dropout=0.0),
+        residual_init=1e-3),
     reconstruction_depth_loss_weight=5.0,
     reconstruction_point_loss_weight=2.0,
     reconstruction_object_head_cfg=dict(
@@ -155,23 +163,16 @@ class_names = [
     'toilet', 'sink', 'bathtub', 'garbagebin'
 ]
 
-train_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_instance_ids_3d',
-    'gt_instances_2d',
-    'pose_matrix', 'axis_align_matrix', 'gt_depths_vggt',
-    'gt_depth_valid_masks', 'gt_scene_points_vggt',
-    'gt_extrinsics_vggt', 'gt_c2w_vggt', 'gt_intrinsics',
-    'vggt_gt_scale'
-]
+train_collect_keys = ['img', 'gt_instances_2d']
 
 test_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix',
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_instances_2d', 'pose_matrix',
     'axis_align_matrix'
 ]
 
 train_input_modality = dict(
     use_camera=True,
-    use_depth=True,
+    use_depth=False,
     use_lidar=False,
     use_neuralrecon_depth=False,
     use_ray=False)
@@ -184,7 +185,6 @@ test_input_modality = dict(
     use_ray=False)
 
 train_pipeline = [
-    dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
         n_images=40,
@@ -192,15 +192,7 @@ train_pipeline = [
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ],
-        loading='random',
-        depth_scale=1000.0
-    ),
-    dict(
-        type='BuildVGGTGroundTruth',
-        points_root=gt_points_dir,
-        num_point_features=6,
-        max_depth=30.0),
-    dict(type='LoadFirstFramePose'),
+        loading='random'),
     dict(type='PackNeRFDetInputs', keys=train_collect_keys)
 ]
 
@@ -208,7 +200,7 @@ test_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
-        n_images=64,
+        n_images=50,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
@@ -235,7 +227,7 @@ train_dataloader = dict(
             pipeline=train_pipeline,
             modality=train_input_modality,
             test_mode=False,
-            filter_empty_gt=True,
+            filter_empty_gt=False,
             box_type_3d='Depth',
             metainfo=dict(CLASSES=class_names))))
 
@@ -266,6 +258,7 @@ val_dataloader = dict(
         type='MultiViewScanNetDataset',
         data_root=data_root,
         ann_file='scannet_infos_val_mvod_with_ids.pkl',
+        ann_file_2d=scannet_ann_root + 'keypoints_bbox_val.json',
         modality=test_input_modality,
         load_eval_anns=True,
         filter_empty_gt=False,
@@ -276,7 +269,13 @@ val_dataloader = dict(
         backend_args=backend_args))
 test_dataloader = val_dataloader
 
-val_evaluator = dict(type='IndoorMetric', iou_thr=[0.25, 0.5])
+val_evaluator = dict(
+    type='SceneCocoMetric',
+    ann_file=scannet_ann_root + 'keypoints_bbox_val.json',
+    metric='bbox',
+    classwise=True,
+    format_only=False,
+    backend_args=backend_args)
 test_evaluator = val_evaluator
 
 # train cfg
@@ -308,7 +307,7 @@ param_scheduler = [
 ]
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule='greater', interval=1, max_keep_ckpts=4),
+    checkpoint=dict(type='CheckpointHook', save_best=['coco/bbox_mAP'], rule='greater', interval=1, max_keep_ckpts=4),
     logger=dict(type='LoggerHook', interval=10)
 )
 

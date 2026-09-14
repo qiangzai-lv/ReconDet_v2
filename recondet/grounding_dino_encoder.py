@@ -71,8 +71,12 @@ class GroundingDINOSemanticEncoder(nn.Module):
                  config: str,
                  checkpoint: str,
                  classes: Sequence[str],
+                 supervise_2d_bbox: bool = False,
+                 pretrain_2d_only: bool = False,
                  reconstruction_depth_loss_weight: float = 1.0,
                  reconstruction_point_loss_weight: float = 0.5,
+                 supervise_instance_consistency: bool = False,
+                 instance_consistency_cfg=None,
                  scene_query_exchange_cfg=None,
                  supervise_confident_query_depth: bool = False,
                  confident_query_depth_cfg=None) -> None:
@@ -80,6 +84,13 @@ class GroundingDINOSemanticEncoder(nn.Module):
         if not classes:
             raise ValueError('GroundingDINO classes must not be empty.')
         self.classes = tuple(classes)
+        self.supervise_2d_bbox = bool(supervise_2d_bbox)
+        self.pretrain_2d_only = bool(pretrain_2d_only)
+        self.supervise_instance_consistency = bool(
+            supervise_instance_consistency)
+        self.use_scene_query_exchange = bool(
+            scene_query_exchange_cfg
+            and scene_query_exchange_cfg.get('enabled', True))
         self.supervise_confident_query_depth = bool(
             supervise_confident_query_depth)
         config_path = Path(config).expanduser()
@@ -95,6 +106,11 @@ class GroundingDINOSemanticEncoder(nn.Module):
             model_cfg.backbone.init_cfg = None
         model_cfg.bbox_head.supervise_confident_query_depth = (
             self.supervise_confident_query_depth)
+        model_cfg.bbox_head.supervise_2d_bbox = self.supervise_2d_bbox
+        model_cfg.bbox_head.supervise_instance_consistency = (
+            self.supervise_instance_consistency)
+        model_cfg.bbox_head.instance_consistency_cfg = (
+            instance_consistency_cfg)
         model_cfg.scene_query_exchange_cfg = scene_query_exchange_cfg
         model_cfg.bbox_head.reconstruction_depth_loss_weight = float(
             reconstruction_depth_loss_weight)
@@ -110,8 +126,9 @@ class GroundingDINOSemanticEncoder(nn.Module):
             checkpoint, map_location='cpu')
         state_dict = checkpoint_data.get('state_dict', checkpoint_data)
         state_dict = extract_grounding_dino_state_dict(state_dict)
-        require_pretrained_instance_projection(
-            state_dict, self.model.bbox_head.instance_projection)
+        if not self.pretrain_2d_only:
+            require_pretrained_instance_projection(
+                state_dict, self.model.bbox_head.instance_projection)
         query_weight = state_dict.get('query_embedding.weight')
         if (query_weight is not None and
                 query_weight.shape != self.model.query_embedding.weight.shape and
@@ -127,6 +144,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
         self.model.eval()
 
         self.token_positive_map = None
+        self.class_positive_map = None
         self.register_buffer(
             'image_mean',
             torch.tensor(image_mean).view(1, 3, 1, 1),
@@ -138,30 +156,56 @@ class GroundingDINOSemanticEncoder(nn.Module):
 
     def _configure_model_trainability(self):
         self.model.requires_grad_(False)
+        if self.supervise_2d_bbox or self.supervise_instance_consistency:
+            for module in (self.model.query_embedding, self.model.decoder,
+                           self.model.bbox_head):
+                module.requires_grad_(True)
+        scene_query_exchange = getattr(
+            self.model, 'scene_query_exchange', None)
+        if (scene_query_exchange is not None
+                and (self.supervise_2d_bbox
+                     or self.supervise_instance_consistency)):
+            scene_query_exchange.requires_grad_(True)
         reconstruction_decoder = self.model.reconstruction_decoder
-        if reconstruction_decoder is not None:
+        if reconstruction_decoder is not None and not self.pretrain_2d_only:
             reconstruction_decoder.requires_grad_(True)
-        self.model.bbox_head.reconstruction_head.requires_grad_(True)
+        self.model.bbox_head.reconstruction_head.requires_grad_(
+            not self.pretrain_2d_only)
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # The root training flag is required by Grounding DINO's query setup,
-        # while every frozen 2D child must remain deterministic.
-        for module in self.model.children():
-            module.eval()
-        reconstruction_decoder = self.model.reconstruction_decoder
-        if reconstruction_decoder is not None:
-            reconstruction_decoder.train(mode)
-        self.model.bbox_head.reconstruction_head.train(mode)
+        if not (self.supervise_2d_bbox
+                or self.supervise_instance_consistency):
+            # GroundingDINO checks its root ``training`` flag to construct
+            # the encoder/denoising metadata consumed by bbox_head.loss.
+            # Keep that control flow while all frozen detector children stay
+            # in eval mode.
+            for module in self.model.children():
+                module.eval()
+            reconstruction_decoder = self.model.reconstruction_decoder
+            if reconstruction_decoder is not None:
+                reconstruction_decoder.train(mode)
+            self.model.bbox_head.reconstruction_head.train(mode)
+            return self
+        for module_name in ('backbone', 'neck', 'encoder', 'language_model'):
+            module = getattr(self.model, module_name, None)
+            if module is not None:
+                module.eval()
+        if self.pretrain_2d_only:
+            reconstruction_decoder = self.model.reconstruction_decoder
+            if reconstruction_decoder is not None:
+                reconstruction_decoder.eval()
+            self.model.bbox_head.reconstruction_head.eval()
         return self
 
     def _ensure_token_positive_map(self):
-        if self.token_positive_map is not None:
+        if (self.token_positive_map is not None
+                and self.class_positive_map is not None):
             return
         tokenized, _, tokens_positive, _ = (
             self.model.get_tokens_and_prompts(self.classes, True))
-        self.token_positive_map, _ = self.model.get_positive_map(
-            tokenized, tokens_positive)
+        self.token_positive_map, self.class_positive_map = (
+            self.model.get_positive_map(tokenized, tokens_positive))
 
     def _attach_reconstruction_class_scores(self, reconstruction_outputs):
         if reconstruction_outputs is None:
@@ -190,14 +234,25 @@ class GroundingDINOSemanticEncoder(nn.Module):
                           padded_shape) -> DetDataSample:
         image_shape = self._image_shape(
             source_sample, view_index, padded_shape)
+        ori_shapes = source_sample.metainfo.get('view_ori_shapes')
+        ori_shape = (
+            tuple(ori_shapes[view_index]) if ori_shapes is not None
+            else image_shape)
+        scale_factors = source_sample.metainfo.get('view_scale_factors')
+        scale_factor = (
+            tuple(scale_factors[view_index]) if scale_factors is not None
+            else (1.0, 1.0))
         data_sample = DetDataSample()
         data_sample.set_metainfo({
             'img_shape': image_shape,
-            'ori_shape': image_shape,
+            'ori_shape': ori_shape,
             'batch_input_shape': tuple(padded_shape),
             'pad_shape': tuple(padded_shape),
-            'scale_factor': (1.0, 1.0),
+            'scale_factor': scale_factor,
         })
+        image_ids = source_sample.metainfo.get('view_img_ids')
+        if image_ids is not None:
+            data_sample.set_metainfo({'img_id': int(image_ids[view_index])})
         data_sample.text = self.classes
         data_sample.custom_entities = True
         return data_sample
@@ -238,6 +293,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
                                gt_depth_valid_masks=None,
                                vggt_gt_scale=None,
                                enable_confident_depth=None,
+                               include_reconstruction_targets=True,
                                grouped=False):
         if enable_confident_depth is None:
             enable_confident_depth = getattr(
@@ -285,14 +341,17 @@ class GroundingDINOSemanticEncoder(nn.Module):
                     source_instances, 'instance_ids_3d', None)
                 instances = InstanceData(
                     bboxes=source_instances.bboxes,
-                    labels=source_instances.labels,
-                    centers_3d=source_instances.centers_3d,
-                    centers_3d_vggt=source_instances.centers_3d_vggt,
-                    center_depth_vggt=source_instances.center_depth_vggt,
-                    center_3d_valid_mask=(
-                        source_instances.center_3d_valid_mask),
-                    center_depth_valid_mask=(
-                        source_instances.center_depth_valid_mask))
+                    labels=source_instances.labels)
+                if include_reconstruction_targets:
+                    instances.centers_3d = source_instances.centers_3d
+                    instances.centers_3d_vggt = (
+                        source_instances.centers_3d_vggt)
+                    instances.center_depth_vggt = (
+                        source_instances.center_depth_vggt)
+                    instances.center_3d_valid_mask = (
+                        source_instances.center_3d_valid_mask)
+                    instances.center_depth_valid_mask = (
+                        source_instances.center_depth_valid_mask)
                 if instance_ids_3d is not None:
                     instances.instance_ids_3d = instance_ids_3d
                 sample.gt_instances = instances
@@ -318,7 +377,8 @@ class GroundingDINOSemanticEncoder(nn.Module):
             vggt_gt_scale=vggt_gt_scale,
             enable_confident_depth=(
                 self.supervise_confident_query_depth
-                and return_reconstruction))
+                and return_reconstruction),
+            include_reconstruction_targets=return_reconstruction)
         flattened_vggt_features = None
         if vggt_feature_maps is not None:
             flattened_vggt_features = [
@@ -353,6 +413,48 @@ class GroundingDINOSemanticEncoder(nn.Module):
             self._attach_reconstruction_class_scores(result[2])
         self._reshape_semantic_feature_maps(batch_size, num_views)
         return result
+
+    @torch.no_grad()
+    def predict_scene_2d(self, images, batch_data_samples):
+        batch_size, num_views = images.shape[:2]
+        padded_shape = images.shape[-2:]
+        normalized = self._normalize_images(images, batch_data_samples)
+        if self.supervise_instance_consistency:
+            self._ensure_token_positive_map()
+            view_samples = self._make_training_samples(
+                batch_data_samples, num_views, padded_shape,
+                enable_confident_depth=False,
+                include_reconstruction_targets=False)
+            for sample in view_samples:
+                labels = sample.gt_instances.labels
+                sample.gt_instances.positive_maps = (
+                    self.class_positive_map.to(labels.device)[labels])
+        else:
+            view_samples = [
+                self._make_data_sample(
+                    source_sample, view_index, padded_shape)
+                for source_sample in batch_data_samples
+                for view_index in range(num_views)
+            ]
+        predictions = self.model.predict(
+            normalized, view_samples, rescale=True, num_views=num_views)
+        if len(predictions) != batch_size * num_views:
+            raise RuntimeError('2D predictions do not match the scene views')
+        similarity_stats = None
+        if self.supervise_instance_consistency:
+            similarity_stats = (
+                self.model.bbox_head.compute_instance_similarity_stats(
+                    view_samples, num_views))
+        for batch_index, scene_sample in enumerate(batch_data_samples):
+            start = batch_index * num_views
+            scene_sample.pred_instances_2d = [
+                sample.pred_instances
+                for sample in predictions[start:start + num_views]
+            ]
+            if similarity_stats is not None:
+                scene_sample.instance_similarity_stats = (
+                    similarity_stats[batch_index])
+        return batch_data_samples
 
     def _reshape_semantic_feature_maps(self, batch_size, num_views):
         flat_maps = self.model._last_semantic_feature_maps

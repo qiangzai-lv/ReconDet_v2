@@ -35,7 +35,6 @@ class ReconGroundingDINO(GroundingDINO):
         self._last_reconstruction_hidden_states = None
         self._last_reconstruction_outputs = None
         self.scene_query_exchange = None
-        self.scene_query_exchange_single_view_dropout = 0.0
         if scene_query_exchange_cfg is not None:
             cfg = dict(scene_query_exchange_cfg)
             enabled = bool(cfg.pop('enabled', True))

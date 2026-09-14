@@ -20,23 +20,25 @@ from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
 from recondet.matcher import RepeatedHungarianMatcher
 
 
-def decode_size_residuals(size_residuals, initial_size_anchor,
+def decode_size_residuals(size_residuals, initial_query_sizes,
                           size_logit_range):
     """Decode detached, multiplicative size refinement across layers."""
     if not size_residuals:
         return [], [], []
-    if len(initial_size_anchor) != 3:
-        raise ValueError('initial_size_anchor must contain three values')
     if (len(size_logit_range) != 2
             or size_logit_range[0] >= size_logit_range[1]):
         raise ValueError('size_logit_range must be an increasing pair')
 
     first = size_residuals[0]
-    anchor = torch.as_tensor(
-        initial_size_anchor, device=first.device, dtype=first.dtype)
-    if not torch.isfinite(anchor).all() or (anchor <= 0).any():
-        raise ValueError('initial_size_anchor must be finite and positive')
-    reference_log = anchor.log().view(1, 3, 1).expand_as(first)
+    if initial_query_sizes.ndim != 3 or initial_query_sizes.shape[-1] != 3:
+        raise ValueError('initial_query_sizes must have shape [B, Q, 3]')
+    initial_sizes = initial_query_sizes.to(
+        device=first.device, dtype=first.dtype).transpose(1, 2)
+    if initial_sizes.shape != first.shape:
+        raise ValueError('initial query sizes must match size residuals')
+    if not torch.isfinite(initial_sizes).all() or (initial_sizes <= 0).any():
+        raise ValueError('initial query sizes must be finite and positive')
+    reference_log = initial_sizes.log()
 
     reference_logs = []
     predicted_logs = []
@@ -93,7 +95,6 @@ class ReconDetHead(BaseModule):
                  if_v2_head=False,
                  matcher='repeated_hungarian',
                  loss_layer_ids=None,
-                 initial_size_anchor=(1.0, 1.0, 1.0),
                  gt_repeat_num=5,
                  center_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
                  size_logit_range=(-10.0, 10.0),
@@ -138,15 +139,6 @@ class ReconDetHead(BaseModule):
         if len(size_logit_range) != 2 or size_logit_range[0] >= size_logit_range[1]:
             raise ValueError('size_logit_range must be an increasing pair')
         self.size_logit_range = tuple(float(value) for value in size_logit_range)
-        if len(initial_size_anchor) != 3:
-            raise ValueError('initial_size_anchor must contain three values')
-        initial_size_anchor = torch.tensor(
-            initial_size_anchor, dtype=torch.float32)
-        if (not torch.isfinite(initial_size_anchor).all()
-                or (initial_size_anchor <= 0).any()):
-            raise ValueError('initial_size_anchor must be finite and positive')
-        self.register_buffer(
-            'initial_size_anchor', initial_size_anchor, persistent=False)
         self.gt_repeat_num = int(gt_repeat_num)
         self.center_range = tuple(float(value) for value in center_range)
         if loss_layer_ids is None:
@@ -190,7 +182,7 @@ class ReconDetHead(BaseModule):
             nn.init.constant_(semcls_head.layers[-1].bias, prior_bias)
 
     def forward(self, x, batch_inputs_dict, refined_query_xyz=None,
-                layer_ids=None):
+                initial_query_sizes=None, layer_ids=None):
         if layer_ids is None:
             layer_ids = list(range(len(x)))
         if len(layer_ids) != len(x):
@@ -200,6 +192,8 @@ class ReconDetHead(BaseModule):
                 'Size refinement requires all decoder layers in order')
         if refined_query_xyz is None or len(refined_query_xyz) != len(x):
             raise ValueError('Refined references must match decoder outputs')
+        if initial_query_sizes is None:
+            raise ValueError('Initial query sizes are required')
 
         center_preds = []
         size_residual_preds = []
@@ -214,7 +208,7 @@ class ReconDetHead(BaseModule):
             size_reference_logs, size_log_preds, size_preds = (
                 decode_size_residuals(
                     [residual.float() for residual in size_residual_preds],
-                    self.initial_size_anchor,
+                    initial_query_sizes,
                     self.size_logit_range))
         return dict(
             center_preds=center_preds,
@@ -225,11 +219,13 @@ class ReconDetHead(BaseModule):
             cls_preds=cls_preds)
 
     def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
-             batch_inputs_dict: dict, refined_query_xyz=None, **kwargs) -> dict:
+             batch_inputs_dict: dict, refined_query_xyz=None,
+             initial_query_sizes=None, **kwargs) -> dict:
         if refined_query_xyz is None or len(refined_query_xyz) != len(x):
             raise ValueError('Loss requires one refined reference per layer')
         layer_ids = self.loss_layer_ids
-        outputs = self(x, batch_inputs_dict, refined_query_xyz)
+        outputs = self(
+            x, batch_inputs_dict, refined_query_xyz, initial_query_sizes)
 
         if 'points' in batch_inputs_dict.keys():
             batch_input_points = batch_inputs_dict['points']
@@ -398,13 +394,16 @@ class ReconDetHead(BaseModule):
     def predict(self,
                 x: Tuple[Tensor],
                 batch_data_samples: SampleList, batch_inputs_dict,
-                refined_query_xyz=None, layer_ids=None,
+                refined_query_xyz=None, initial_query_sizes=None,
+                layer_ids=None,
                 rescale: bool = False) -> InstanceList:
 
         batch_input_metas = [
             data_samples.metainfo for data_samples in batch_data_samples
         ]
-        outputs = self(x, batch_inputs_dict, refined_query_xyz, layer_ids)
+        outputs = self(
+            x, batch_inputs_dict, refined_query_xyz,
+            initial_query_sizes, layer_ids)
         predictions = self.predict_by_feat(
             [outputs['center_preds'][-1]],
             [outputs['size_preds'][-1]],

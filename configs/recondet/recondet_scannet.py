@@ -16,7 +16,7 @@ gt_points_dir = f'{data_root}/points'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
 
 grounding_dino_config = 'configs/gdino/grounding_dino_swin-t_pretrain_obj365.py'
-grounding_dino_checkpoint = '/root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'
+grounding_dino_checkpoint = '/root/shared-nvme/code/Recondet_up/work_dirs/recondet_scannet/epoch_1.pth'
 grounding_dino_classes = [
     'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
     'picture', 'counter', 'desk', 'curtain', 'refrigerator', 'shower curtain',
@@ -56,11 +56,9 @@ model = dict(
         dec_nlayers=_decoder_layer_num
     ),
     deformable_num_points=4,
-    query_clustering_cfg=dict(
-        num_neighbors=4,
-        class_cost_weight=0.5,
-        query_cost_weight=0.25,
-        min_cluster_size=0.05),
+    reconstruction_nms_cfg=dict(
+        iou_thr=0.25,
+        fallback_bbox_size=(1.0, 1.0, 1.0)),
     query_xyz_range=_query_xyz_range_,
     gt_points_dir=gt_points_dir,
     supervise_2d_bbox=False,
@@ -86,10 +84,10 @@ model = dict(
         instance_dims=128,
         temperature=0.07,
         instance_weight=0.2,
+        cls_weight=1.0,
         center_weight=0.5,
-        bbox_weight=1.0,
-        giou_weight=0.5,
-        min_bbox_views=2),
+        size_weight=1.0,
+        giou_weight=0.5),
     supervise_camera_head=True,
     prediction_visualization=False,
     prediction_visualization_dir='work_dirs/recondet_visualizations',
@@ -140,7 +138,6 @@ model = dict(
         ),
         if_v2_head=True,
         matcher='repeated_hungarian',
-        initial_size_anchor=(1.0, 1.0, 1.0),
         gt_repeat_num=5,
         center_range=_query_xyz_range_,
         size_logit_range=(-5.0, 5.0),

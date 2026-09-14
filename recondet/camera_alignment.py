@@ -77,6 +77,57 @@ def denormalize_vggt_gt_points(points, first_frame_pose, axis_align_matrix,
     return aligned_points
 
 
+def aligned_boxes_to_vggt(centers, sizes, first_frame_pose,
+                          axis_align_matrix, scene_scale):
+    """Convert aligned metric AABBs to AABBs in normalized VGGT axes."""
+    if centers.ndim != 2 or centers.shape[-1] != 3:
+        raise ValueError('box centers must have shape [G, 3]')
+    if sizes.shape != centers.shape:
+        raise ValueError('box sizes must match box centers')
+    if not torch.isfinite(centers).all() or not torch.isfinite(sizes).all():
+        raise ValueError('box centers and sizes must be finite')
+    if (sizes <= 0).any():
+        raise ValueError('box sizes must be positive')
+
+    reference = centers.new_empty((1, 0, 3))
+    with torch.autocast(device_type=centers.device.type, enabled=False):
+        _, normalized_to_aligned, _ = _gt_inverse_components(
+            reference, first_frame_pose, axis_align_matrix, scene_scale)
+        aligned_to_vggt = torch.linalg.inv(normalized_to_aligned)[0]
+        linear = aligned_to_vggt[:3, :3]
+        centers_vggt = torch.einsum(
+            'ij,gj->gi', linear, centers.float())
+        centers_vggt = centers_vggt + aligned_to_vggt[:3, 3]
+        sizes_vggt = torch.einsum(
+            'ij,gj->gi', linear.abs(), sizes.float())
+    return centers_vggt, sizes_vggt
+
+
+def denormalize_vggt_boxes(centers, sizes, first_frame_pose,
+                           axis_align_matrix, scene_scale):
+    """Convert normalized VGGT AABBs to aligned metric AABBs."""
+    if centers.ndim != 4 or centers.shape[-1] != 3:
+        raise ValueError('box centers must have shape [B, V, Q, 3]')
+    if sizes.shape != centers.shape:
+        raise ValueError('box sizes must match box centers')
+    if not torch.isfinite(centers).all() or not torch.isfinite(sizes).all():
+        raise ValueError('box centers and sizes must be finite')
+    if (sizes <= 0).any():
+        raise ValueError('box sizes must be positive')
+
+    with torch.autocast(device_type=centers.device.type, enabled=False):
+        _, normalized_to_aligned, _ = _gt_inverse_components(
+            centers, first_frame_pose, axis_align_matrix, scene_scale)
+        linear = normalized_to_aligned[:, :3, :3]
+        centers_aligned = torch.einsum(
+            'bij,bvqj->bvqi', linear, centers.float())
+        centers_aligned = centers_aligned + normalized_to_aligned[
+            :, None, None, :3, 3]
+        sizes_aligned = torch.einsum(
+            'bij,bvqj->bvqi', linear.abs(), sizes.float())
+    return centers_aligned, sizes_aligned
+
+
 @torch.no_grad()
 def denormalize_vggt_gt_cameras(extrinsics, first_frame_pose,
                                 axis_align_matrix, scene_scale):

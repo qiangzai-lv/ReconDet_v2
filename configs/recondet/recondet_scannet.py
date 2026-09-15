@@ -231,7 +231,7 @@ train_dataloader = dict(
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
         type='RepeatDataset',
-        times=1,
+        times=6,
         dataset=dict(
             type=dataset_type,
             data_root=data_root,
@@ -287,7 +287,7 @@ test_evaluator = val_evaluator
 # train cfg
 _warm_epoch = 0
 _max_epoch = 200
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=1)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=2)
 test_cfg = dict()
 val_cfg = dict()
 
@@ -313,7 +313,7 @@ param_scheduler = [
 ]
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule='greater', interval=1, max_keep_ckpts=4),
+    checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule='greater', interval=2, max_keep_ckpts=4),
     logger=dict(type='LoggerHook', interval=10)
 )
 

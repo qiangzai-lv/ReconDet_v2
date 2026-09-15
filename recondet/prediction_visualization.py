@@ -13,6 +13,15 @@ import torch
 _EDGES = ((0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
           (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7))
 
+_DEFAULT_CLASS_COLORS = {
+    0: (230, 25, 75), 1: (60, 180, 75), 2: (255, 225, 25),
+    3: (0, 130, 200), 4: (245, 130, 48), 5: (145, 30, 180),
+    6: (70, 240, 240), 7: (240, 50, 230), 8: (210, 245, 60),
+    9: (250, 190, 190), 10: (0, 128, 128), 11: (230, 190, 255),
+    12: (170, 110, 40), 13: (255, 250, 200), 14: (128, 0, 0),
+    15: (170, 255, 195), 16: (128, 128, 0), 17: (255, 215, 180),
+}
+
 
 def _corners(center, size):
     signs = np.array([
@@ -53,6 +62,73 @@ def write_binary_ply(path, points, colors):
         handle.write(header)
         for point, color in zip(points, colors):
             handle.write(struct.pack('<fffBBB', *point, *color))
+
+
+def _colored_box_overlay(path, gt_boxes, gt_labels, boxes, labels,
+                         class_colors, box_line_step):
+    parts, colors = [], []
+    gt_centers, gt_sizes = _box_center_size(gt_boxes)
+    raw_boxes = _tensor(boxes)
+    if raw_boxes.size:
+        box_centers, box_sizes = _box_center_size(boxes)
+        boxes = np.concatenate((box_centers, box_sizes), axis=1)
+    else:
+        boxes = np.empty((0, 6), np.float32)
+    labels = _tensor(labels).reshape(-1).astype(np.int64)
+    if len(boxes) != len(labels):
+        raise ValueError('boxes and labels must have the same length')
+    for center, size, label in zip(gt_centers, gt_sizes, _tensor(gt_labels).reshape(-1)):
+        color = class_colors.get(int(label), (150, 150, 150))
+        _append_box(parts, colors, center, size, color, box_line_step)
+    for center, size, label in zip(boxes[:, :3], boxes[:, 3:6], labels):
+        color = class_colors.get(int(label), (150, 150, 150))
+        _append_box(parts, colors, center, size, color, box_line_step)
+    if not parts:
+        parts.append(np.empty((0, 3), np.float32)); colors.append(np.empty((0, 3), np.uint8))
+    write_binary_ply(path, np.concatenate(parts), np.concatenate(colors))
+
+
+def save_scene_reconstruction_visualizations(
+        output_dir, scene_id, gt_points, gt_boxes, gt_labels,
+        reconstruction_points, reconstruction_labels,
+        reconstruction_boxes_before_nms, reconstruction_labels_before_nms,
+        reconstruction_boxes_after_nms, reconstruction_labels_after_nms,
+        fallback_boxes, final_boxes, final_labels, class_colors=None,
+        box_line_step=0.03, max_points=200000):
+    """Write five stage-specific PLY overlays for one aligned scene."""
+    output_dir = Path(output_dir) / str(scene_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    class_colors = dict(_DEFAULT_CLASS_COLORS if class_colors is None else class_colors)
+    points = _tensor(reconstruction_points).reshape(-1, 3)
+    point_labels = _tensor(reconstruction_labels).reshape(-1).astype(np.int64)
+    gt = _tensor(gt_points).reshape(-1, 3)[:, :3]
+    if len(points) != len(point_labels):
+        raise ValueError('reconstruction points and labels must have same length')
+    if len(gt) > max_points:
+        gt = gt[np.linspace(0, len(gt) - 1, max_points).astype(np.int64)]
+    point_parts = [gt]
+    point_colors = [np.full_like(gt, (150, 150, 150), dtype=np.uint8)]
+    for label in np.unique(point_labels):
+        selected = points[point_labels == label]
+        if len(selected):
+            point_parts.append(selected)
+            point_colors.append(np.broadcast_to(
+                class_colors.get(int(label), (150, 150, 150)), selected.shape).copy())
+    point_path = output_dir / 'reconstruction_points_vs_gt.ply'
+    write_binary_ply(point_path, np.concatenate(point_parts), np.concatenate(point_colors))
+    paths = {'reconstruction_points': point_path}
+    stages = (
+        ('boxes_before_nms', reconstruction_boxes_before_nms, reconstruction_labels_before_nms),
+        ('boxes_after_nms', reconstruction_boxes_after_nms, reconstruction_labels_after_nms),
+        ('fallback_boxes', fallback_boxes, np.full((len(_tensor(fallback_boxes).reshape(-1, 6)),), -1)),
+        ('final_detection', final_boxes, final_labels),
+    )
+    for name, boxes, labels in stages:
+        path = output_dir / f'{name}_vs_gt.ply'
+        _colored_box_overlay(path, gt_boxes, gt_labels, boxes, labels,
+                             class_colors, box_line_step)
+        paths[name] = path
+    return paths
 
 
 def _tensor(value):

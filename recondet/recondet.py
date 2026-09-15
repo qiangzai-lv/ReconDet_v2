@@ -27,7 +27,8 @@ from recondet.vggt_lora import (
     configure_vggt_lora, enable_lora_parameters,
     log_vggt_lora_summary, vggt_feature_grad_context)
 from recondet.prediction_visualization import (
-    save_scene_cluster_visualization, save_scene_prediction_visualization)
+    save_scene_reconstruction_visualizations)
+from configs.recondet.visualization_colors import CLASS_COLORS
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.pose_enc import encoding_to_camera
 
@@ -403,8 +404,21 @@ class ReconDet(Base3DDetector):
         selected['diagnostics'] = [dict(
             reconstruction_points=candidate_centers[index].detach(),
             reconstruction_scores=candidate_scores[index].detach(),
-            cluster_centers=selected['query_xyz'][index].detach(),
-            cluster_sizes=selected['query_size'][index].detach())
+            reconstruction_labels=reconstruction_outputs['bbox_labels'].reshape(
+                batch_size, num_views * query_count)[index].detach(),
+            boxes_before_nms=torch.cat([
+                reconstruction_outputs['bbox_centers_aligned'].reshape(
+                    batch_size, num_views * query_count, 3)[index],
+                reconstruction_outputs['bbox_sizes_aligned'].reshape(
+                    batch_size, num_views * query_count, 3)[index]], dim=-1).detach(),
+            labels_before_nms=reconstruction_outputs['bbox_labels'].reshape(
+                batch_size, num_views * query_count)[index].detach(),
+            boxes_after_nms=torch.cat([
+                selected['query_xyz'][index], selected['query_size'][index]], dim=-1).detach(),
+            labels_after_nms=selected['labels'][index].detach(),
+            fallback_boxes=torch.cat([
+                selected['query_xyz'][index][selected['source_indices'][index] < 0],
+                selected['query_size'][index][selected['source_indices'][index] < 0]], dim=-1).detach())
             for index in range(batch_size)]
         return selected
 
@@ -583,30 +597,21 @@ class ReconDet(Base3DDetector):
             _, gt_points = self._load_axis_aligned_gt_points(metadata)
             gt = sample.gt_instances_3d
             scene_id = metadata.get('scene_id', f'scene_{batch_index}')
-            save_scene_prediction_visualization(
-                self.prediction_visualization_dir,
-                scene_id,
-                gt_points,
-                gt.bboxes_3d,
-                gt.labels_3d,
-                result.bboxes_3d,
-                result.scores_3d,
-                result.labels_3d,
-                points[batch_index].reshape(-1, 3),
-                scores[batch_index].reshape(-1),
-                self.semantic_encoder.classes,
-                score_threshold=self.prediction_visualization_score_thr)
-            if cluster_diagnostics is not None:
-                diagnostics = cluster_diagnostics[batch_index]
-                save_scene_cluster_visualization(
+            diagnostics = cluster_diagnostics[batch_index]
+            save_scene_reconstruction_visualizations(
                     self.prediction_visualization_dir,
                     scene_id,
                     gt_points,
+                    gt.bboxes_3d, gt.labels_3d,
                     diagnostics['reconstruction_points'],
-                    diagnostics['reconstruction_scores'],
-                    diagnostics['cluster_centers'],
-                    diagnostics['cluster_sizes'],
-                    score_threshold=self.prediction_visualization_score_thr)
+                    diagnostics['reconstruction_labels'],
+                    diagnostics['boxes_before_nms'],
+                    diagnostics['labels_before_nms'],
+                    diagnostics['boxes_after_nms'],
+                    diagnostics['labels_after_nms'],
+                    diagnostics['fallback_boxes'],
+                    result.bboxes_3d, result.labels_3d,
+                    class_colors=CLASS_COLORS)
 
     def _forward(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                  *args, **kwargs) -> Tuple[List[torch.Tensor]]:

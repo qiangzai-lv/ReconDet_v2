@@ -401,25 +401,30 @@ class ReconDet(Base3DDetector):
                 batch_size, num_views * query_count, 3)
         candidate_scores = reconstruction_outputs['bbox_scores'].reshape(
             batch_size, num_views * query_count)
-        selected['diagnostics'] = [dict(
+        selected['diagnostics'] = []
+        for index in range(batch_size):
+            valid = selected['candidate_valid_mask'][index]
+            real = selected['source_indices'][index] >= 0
+            fallback = ~real
+            selected['diagnostics'].append(dict(
             reconstruction_points=candidate_centers[index].detach(),
             reconstruction_scores=candidate_scores[index].detach(),
             reconstruction_labels=reconstruction_outputs['bbox_labels'].reshape(
                 batch_size, num_views * query_count)[index].detach(),
             boxes_before_nms=torch.cat([
                 reconstruction_outputs['bbox_centers_aligned'].reshape(
-                    batch_size, num_views * query_count, 3)[index],
+                    batch_size, num_views * query_count, 3)[index][valid],
                 reconstruction_outputs['bbox_sizes_aligned'].reshape(
-                    batch_size, num_views * query_count, 3)[index]], dim=-1).detach(),
+                    batch_size, num_views * query_count, 3)[index][valid]], dim=-1).detach(),
             labels_before_nms=reconstruction_outputs['bbox_labels'].reshape(
-                batch_size, num_views * query_count)[index].detach(),
+                batch_size, num_views * query_count)[index][valid].detach(),
             boxes_after_nms=torch.cat([
-                selected['query_xyz'][index], selected['query_size'][index]], dim=-1).detach(),
-            labels_after_nms=selected['labels'][index].detach(),
+                selected['query_xyz'][index][real],
+                selected['query_size'][index][real]], dim=-1).detach(),
+            labels_after_nms=selected['labels'][index][real].detach(),
             fallback_boxes=torch.cat([
-                selected['query_xyz'][index][selected['source_indices'][index] < 0],
-                selected['query_size'][index][selected['source_indices'][index] < 0]], dim=-1).detach())
-            for index in range(batch_size)]
+                selected['query_xyz'][index][fallback],
+                selected['query_size'][index][fallback]], dim=-1).detach()))
         return selected
 
     def _predict_reconstruction_objects(self, reconstruction_outputs):
@@ -612,6 +617,16 @@ class ReconDet(Base3DDetector):
                     diagnostics['fallback_boxes'],
                     result.bboxes_3d, result.labels_3d,
                     class_colors=CLASS_COLORS)
+            from mmengine.logging import MMLogger
+            MMLogger.get_current_instance().info(
+                'Prediction visualization box counts: '
+                f'scene={scene_id} gt_boxes={len(gt.labels_3d)} '
+                f'reconstruction_before_nms='
+                f'{len(diagnostics["labels_before_nms"])} '
+                f'reconstruction_after_nms='
+                f'{len(diagnostics["labels_after_nms"])} '
+                f'fallback_boxes={len(diagnostics["fallback_boxes"])} '
+                f'final_detection_boxes={len(result.labels_3d)}')
 
     def _forward(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                  *args, **kwargs) -> Tuple[List[torch.Tensor]]:

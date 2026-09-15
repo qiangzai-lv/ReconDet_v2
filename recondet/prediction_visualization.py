@@ -134,6 +134,9 @@ def save_scene_reconstruction_visualizations(
 def _tensor(value):
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().float().numpy()
+    wrapped_tensor = getattr(value, 'tensor', None)
+    if isinstance(wrapped_tensor, torch.Tensor):
+        return _tensor(wrapped_tensor)
     return np.asarray(value)
 
 

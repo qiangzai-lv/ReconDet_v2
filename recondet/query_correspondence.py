@@ -145,4 +145,5 @@ def select_reconstruction_boxes(
         'scores': torch.stack(output_scores),
         'labels': torch.stack(output_labels),
         'source_indices': torch.stack(output_source_indices),
+        'candidate_valid_mask': valid,
     }

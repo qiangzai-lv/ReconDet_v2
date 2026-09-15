@@ -16,7 +16,7 @@ gt_points_dir = f'{data_root}/points'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
 
 grounding_dino_config = 'configs/gdino/grounding_dino_swin-t_pretrain_obj365.py'
-grounding_dino_checkpoint = '/root/shared-nvme/code/Recondet_up/work_dirs/recondet_scannet/epoch_1.pth'
+grounding_dino_checkpoint = '/root/shared-nvme/code/Recondet_up/work_dirs/recondet_scannet/epoch_2.pth'
 grounding_dino_classes = [
     'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
     'picture', 'counter', 'desk', 'curtain', 'refrigerator', 'shower curtain',
@@ -57,8 +57,8 @@ model = dict(
     ),
     deformable_num_points=4,
     reconstruction_nms_cfg=dict(
-        iou_thr=0.25,
-        fallback_bbox_size=(1.0, 1.0, 1.0)),
+        iou_thr=0.5,
+        foreground_score_thr=0.1),
     query_xyz_range=_query_xyz_range_,
     gt_points_dir=gt_points_dir,
     supervise_2d_bbox=False,

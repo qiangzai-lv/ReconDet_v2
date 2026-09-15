@@ -165,21 +165,16 @@ class ReconDet(Base3DDetector):
         self.test_cfg = test_cfg
 
         self.num_queries = num_queries
-        self.fallback_detection_queries = torch.nn.Embedding(
-            num_queries, token_dim)
-        torch.nn.init.normal_(
-            self.fallback_detection_queries.weight, mean=0.0, std=0.02)
         reconstruction_nms_cfg = dict(reconstruction_nms_cfg or {})
         unknown_nms_keys = set(reconstruction_nms_cfg) - {
-            'iou_thr', 'fallback_bbox_size'}
+            'iou_thr', 'foreground_score_thr'}
         if unknown_nms_keys:
             raise ValueError(
                 f'Unknown reconstruction NMS keys: {sorted(unknown_nms_keys)}')
         self.reconstruction_nms_iou_thr = float(
             reconstruction_nms_cfg.get('iou_thr', 0.25))
-        self.fallback_bbox_size = tuple(float(value) for value in
-                                        reconstruction_nms_cfg.get(
-                                            'fallback_bbox_size', (1, 1, 1)))
+        self.reconstruction_foreground_score_thr = float(
+            reconstruction_nms_cfg.get('foreground_score_thr', 0.1))
         self.test_only_last_layer = test_only_last_layer
 
         self.pos_embedding = PositionEmbeddingCoordsSine(
@@ -211,7 +206,7 @@ class ReconDet(Base3DDetector):
     def _configure_2d_pretrain_trainability(self):
         frozen_modules = (
             self.vggt_encoder, self.feature_projector,
-            self.reconstruction_object_head, self.fallback_detection_queries,
+            self.reconstruction_object_head,
             self.decoder, self.bbox_head,
             self.pos_embedding, self.query_projection)
         for module in frozen_modules:
@@ -389,28 +384,31 @@ class ReconDet(Base3DDetector):
             num_views=num_views,
             num_queries=self.num_queries,
             query_xyz_range=self.query_xyz_range,
-            fallback_bbox_size=self.fallback_bbox_size,
             nms_iou_thr=self.reconstruction_nms_iou_thr,
-            fallback_queries=self.fallback_detection_queries.weight,
             logger=MMLogger.get_current_instance(),
             scene_ids=[sample.metainfo.get('scene_id', index)
-                       for index, sample in enumerate(batch_data_samples)])
+                       for index, sample in enumerate(batch_data_samples)],
+            foreground_score_thr=self.reconstruction_foreground_score_thr)
         query_count = reconstruction_outputs['bbox_scores'].shape[1]
         candidate_centers = reconstruction_outputs[
             'bbox_centers_aligned'].reshape(
                 batch_size, num_views * query_count, 3)
-        candidate_scores = reconstruction_outputs['bbox_scores'].reshape(
-            batch_size, num_views * query_count)
+        reconstruction_points = reconstruction_outputs[
+            'points_aligned'].reshape(
+                batch_size, num_views * query_count, 3)
+        class_scores_2d = reconstruction_outputs['class_scores_2d'].reshape(
+            batch_size, num_views * query_count, -1)
+        foreground_scores_2d, foreground_labels_2d = (
+            class_scores_2d.max(dim=-1))
         selected['diagnostics'] = []
         for index in range(batch_size):
             valid = selected['candidate_valid_mask'][index]
-            real = selected['source_indices'][index] >= 0
-            fallback = ~real
+            fallback = selected['fallback_mask'][index]
+            real = ~fallback
             selected['diagnostics'].append(dict(
-            reconstruction_points=candidate_centers[index].detach(),
-            reconstruction_scores=candidate_scores[index].detach(),
-            reconstruction_labels=reconstruction_outputs['bbox_labels'].reshape(
-                batch_size, num_views * query_count)[index].detach(),
+            reconstruction_points=reconstruction_points[index].detach(),
+            reconstruction_scores=foreground_scores_2d[index].detach(),
+            reconstruction_labels=foreground_labels_2d[index].detach(),
             boxes_before_nms=torch.cat([
                 reconstruction_outputs['bbox_centers_aligned'].reshape(
                     batch_size, num_views * query_count, 3)[index][valid],

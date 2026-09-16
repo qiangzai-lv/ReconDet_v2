@@ -8,7 +8,8 @@ from mmdet.utils import reduce_mean
 from mmdet3d.registry import MODELS
 from torch import Tensor
 
-from recondet.camera_alignment import aligned_boxes_to_vggt
+from recondet.camera_alignment import (
+    aligned_boxes_to_vggt, denormalize_vggt_boxes)
 from mmdet3d.structures.ops.iou3d_calculator import (
     axis_aligned_bbox_overlaps_3d)
 
@@ -153,6 +154,10 @@ class ReconstructionObjectHead(nn.Module):
             dtype=torch.long, device=device)
         bbox_centers = logits.new_zeros(num_flat_views, num_queries, 3)
         bbox_sizes = logits.new_zeros(num_flat_views, num_queries, 3)
+        bbox_centers_aligned = logits.new_zeros(
+            num_flat_views, num_queries, 3)
+        bbox_sizes_aligned = logits.new_zeros(
+            num_flat_views, num_queries, 3)
         bbox_valid = torch.zeros(
             num_flat_views, num_queries, dtype=torch.bool, device=device)
         identity_flat_indices = []
@@ -185,7 +190,8 @@ class ReconstructionObjectHead(nn.Module):
                              if count != 1}
             scene_targets.append((id_to_index, duplicate_ids,
                                   missing_id_field, labels_3d,
-                                  centers_vggt, sizes_vggt))
+                                  centers_vggt, sizes_vggt,
+                                  centers_aligned, sizes_aligned))
 
         for flat_view, (query_indices, gt_indices) in enumerate(matches):
             scene_index = flat_view // num_views
@@ -216,7 +222,8 @@ class ReconstructionObjectHead(nn.Module):
                 ids_2d[valid_identity], view_index))
 
             (id_to_index, duplicate_ids, missing_id_field, labels_3d,
-             centers_vggt, sizes_vggt) = scene_targets[scene_index]
+             centers_vggt, sizes_vggt, centers_aligned,
+             sizes_aligned) = scene_targets[scene_index]
             for query_index, gt_index, label_2d, instance_id in zip(
                     query_indices.tolist(), gt_indices.tolist(),
                     labels_2d.tolist(), ids_2d.tolist()):
@@ -242,6 +249,10 @@ class ReconstructionObjectHead(nn.Module):
                     continue
                 bbox_centers[flat_view, query_index] = centers_vggt[box_index]
                 bbox_sizes[flat_view, query_index] = sizes_vggt[box_index]
+                bbox_centers_aligned[flat_view, query_index] = (
+                    centers_aligned[box_index])
+                bbox_sizes_aligned[flat_view, query_index] = (
+                    sizes_aligned[box_index])
                 bbox_valid[flat_view, query_index] = True
 
         if errors:
@@ -253,6 +264,8 @@ class ReconstructionObjectHead(nn.Module):
             'cls_targets': cls_targets,
             'bbox_centers_vggt': bbox_centers,
             'bbox_sizes_vggt': bbox_sizes,
+            'bbox_centers_aligned': bbox_centers_aligned,
+            'bbox_sizes_aligned': bbox_sizes_aligned,
             'bbox_valid': bbox_valid,
             'identity_flat_indices': (
                 torch.cat(identity_flat_indices)
@@ -305,9 +318,29 @@ class ReconstructionObjectHead(nn.Module):
                 pred_centers, target_centers, reduction='sum') / bbox_avg_factor
             size_loss = F.smooth_l1_loss(
                 pred_sizes, target_sizes, reduction='sum') / bbox_avg_factor
-            pred_boxes = _center_size_to_minmax(pred_centers, pred_sizes)
+            flat_scene_indices = torch.arange(
+                len(batch_data_samples), device=valid.device).repeat_interleave(
+                    num_views)[:, None].expand_as(valid)[valid]
+            pred_centers_aligned = torch.empty_like(pred_centers)
+            pred_sizes_aligned = torch.empty_like(pred_sizes)
+            for scene_index in range(len(batch_data_samples)):
+                scene_mask = flat_scene_indices == scene_index
+                if not scene_mask.any():
+                    continue
+                scene_centers, scene_sizes = denormalize_vggt_boxes(
+                    pred_centers[scene_mask][None],
+                    pred_sizes[scene_mask][None],
+                    self._batch_item(first_frame_pose, scene_index),
+                    self._batch_item(axis_align_matrix, scene_index),
+                    self._batch_item(scene_scale, scene_index))
+                pred_centers_aligned[scene_mask] = scene_centers[0]
+                pred_sizes_aligned[scene_mask] = scene_sizes[0]
+            target_centers_aligned = targets['bbox_centers_aligned'][valid]
+            target_sizes_aligned = targets['bbox_sizes_aligned'][valid]
+            pred_boxes = _center_size_to_minmax(
+                pred_centers_aligned, pred_sizes_aligned)
             target_boxes = _center_size_to_minmax(
-                target_centers, target_sizes)
+                target_centers_aligned, target_sizes_aligned)
             giou = axis_aligned_bbox_overlaps_3d(
                 pred_boxes.unsqueeze(0), target_boxes.unsqueeze(0),
                 mode='giou', is_aligned=True).squeeze(0)

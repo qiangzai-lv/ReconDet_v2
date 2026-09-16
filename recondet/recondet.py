@@ -9,9 +9,8 @@ from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
 from recondet.camera_alignment import (
-    denormalize_vggt_boxes, denormalize_vggt_gt_cameras,
-    denormalize_vggt_gt_points,
-    load_axis_aligned_points, normalize_query_points)
+    denormalize_vggt_boxes, denormalize_vggt_gt_points,
+    load_axis_aligned_points)
 from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.device import autocast, get_device
@@ -63,7 +62,6 @@ class ReconDet(Base3DDetector):
             vggt_lora_cfg=None,
             deformable_num_points=4,
             reconstruction_nms_cfg=None,
-            query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
             gt_points_dir=None,
             supervise_2d_bbox=False,
             train_2d_only=False,
@@ -189,9 +187,6 @@ class ReconDet(Base3DDetector):
             hidden_use_bias=True,
         )
         self.if_mix_precision = if_mix_precision
-        if len(query_xyz_range) != 6:
-            raise ValueError('query_xyz_range must contain 6 values')
-        self.query_xyz_range = tuple(float(value) for value in query_xyz_range)
         if gt_points_dir is None:
             raise ValueError('VGGT GT inverse alignment requires gt_points_dir')
         self.gt_points_dir = Path(gt_points_dir)
@@ -323,78 +318,66 @@ class ReconDet(Base3DDetector):
                 pose_encoding.detach(), images.shape[-2:])
         scene_scale = self._resolve_vggt_gt_scale(
             batch_inputs_dict, batch_data_samples, images)
-        aligned_extrinsics = denormalize_vggt_gt_cameras(
-            extrinsics,
-            batch_inputs_dict['pose_matrix'],
-            batch_inputs_dict['axis_align_matrix'],
-            scene_scale)
 
         intrinsics = intrinsics.float()
         if not torch.isfinite(intrinsics).all():
             raise FloatingPointError('VGGT intrinsics contain non-finite values')
         batch_inputs_dict['vggt_gt_scale'] = scene_scale.detach()
         batch_inputs_dict['vggt_raw_extrinsics'] = extrinsics.detach()
-        batch_inputs_dict['vggt_extrinsics'] = aligned_extrinsics.detach()
         batch_inputs_dict['vggt_intrinsics'] = intrinsics.detach()
         del cached_tokens
-        cameras = (extrinsics.detach(), aligned_extrinsics.detach(),
-                   intrinsics.detach())
+        cameras = (extrinsics.detach(), intrinsics.detach())
         if return_pose_encoding:
             return cameras + (pose_encoding,)
         return cameras
 
-    def _align_reconstruction_outputs(self, reconstruction_outputs,
-                                      batch_inputs_dict, images):
+    def _select_reconstruction_boxes(self, reconstruction_outputs, images,
+                                     batch_data_samples,
+                                     batch_inputs_dict):
         batch_size, num_views = images.shape[:2]
-        points_vggt = reconstruction_outputs['points_vggt']
-        query_count = points_vggt.shape[1]
-        points_vggt = points_vggt.reshape(
-            batch_size, num_views, query_count, 3)
-        points_aligned = denormalize_vggt_gt_points(
-            points_vggt,
+        from mmengine.logging import MMLogger
+        query_count = reconstruction_outputs['bbox_scores'].shape[1]
+        candidate_shape = (batch_size, num_views, query_count, 3)
+        candidate_centers_vggt = reconstruction_outputs[
+            'bbox_centers_vggt'].reshape(candidate_shape)
+        candidate_sizes_vggt = reconstruction_outputs[
+            'bbox_sizes_vggt'].reshape(candidate_shape)
+        candidate_centers_aligned = denormalize_vggt_gt_points(
+            candidate_centers_vggt.detach(),
             batch_inputs_dict['pose_matrix'],
             batch_inputs_dict['axis_align_matrix'],
             batch_inputs_dict['vggt_gt_scale'])
-        outputs = dict(reconstruction_outputs)
-        outputs['points_aligned'] = points_aligned.reshape(
-            batch_size * num_views, query_count, 3)
-        if ('bbox_centers_vggt' in outputs
-                and 'bbox_sizes_vggt' in outputs):
-            centers_vggt = outputs['bbox_centers_vggt'].reshape(
-                batch_size, num_views, query_count, 3)
-            sizes_vggt = outputs['bbox_sizes_vggt'].reshape_as(centers_vggt)
-            centers_aligned, sizes_aligned = denormalize_vggt_boxes(
-                centers_vggt, sizes_vggt,
-                batch_inputs_dict['pose_matrix'],
-                batch_inputs_dict['axis_align_matrix'],
-                batch_inputs_dict['vggt_gt_scale'])
-            outputs['bbox_centers_aligned'] = centers_aligned.reshape(
+        scene_scale = torch.as_tensor(
+            batch_inputs_dict['vggt_gt_scale'], device=images.device,
+            dtype=torch.float32).reshape(batch_size)
+        selection_outputs = dict(reconstruction_outputs)
+        selection_outputs['nms_centers_aligned'] = (
+            candidate_centers_aligned.reshape(
+                batch_size * num_views, query_count, 3))
+        selection_outputs['nms_sizes_aligned'] = (
+            candidate_sizes_vggt.detach()
+            * scene_scale[:, None, None, None]).reshape(
                 batch_size * num_views, query_count, 3)
-            outputs['bbox_sizes_aligned'] = sizes_aligned.reshape(
-                batch_size * num_views, query_count, 3)
-        return outputs
-
-    def _select_reconstruction_boxes(self, reconstruction_outputs, images,
-                                     batch_data_samples):
-        batch_size, num_views = images.shape[:2]
-        from mmengine.logging import MMLogger
+        selection_outputs['fallback_size_vggt'] = (
+            torch.ones(batch_size, 3, device=images.device) /
+            scene_scale[:, None])
         selected = select_reconstruction_boxes(
-            reconstruction_outputs,
+            selection_outputs,
             batch_size=batch_size,
             num_views=num_views,
             num_queries=self.num_queries,
-            query_xyz_range=self.query_xyz_range,
             nms_iou_thr=self.reconstruction_nms_iou_thr,
             logger=MMLogger.get_current_instance(),
             scene_ids=[sample.metainfo.get('scene_id', index)
                        for index, sample in enumerate(batch_data_samples)],
             foreground_score_thr=self.reconstruction_foreground_score_thr)
-        query_count = reconstruction_outputs['bbox_scores'].shape[1]
-        candidate_centers = reconstruction_outputs[
-            'bbox_centers_aligned'].reshape(
+        candidate_centers_vggt = reconstruction_outputs[
+            'bbox_centers_vggt'].reshape(
                 batch_size, num_views * query_count, 3)
-        reconstruction_points = reconstruction_outputs[
-            'points_aligned'].reshape(
+        candidate_sizes_vggt = reconstruction_outputs[
+            'bbox_sizes_vggt'].reshape_as(candidate_centers_vggt)
+        reconstruction_points_vggt = reconstruction_outputs[
+            'points_vggt'].reshape(
                 batch_size, num_views * query_count, 3)
         class_scores_2d = reconstruction_outputs['class_scores_2d'].reshape(
             batch_size, num_views * query_count, -1)
@@ -406,23 +389,22 @@ class ReconDet(Base3DDetector):
             fallback = selected['fallback_mask'][index]
             real = ~fallback
             selected['diagnostics'].append(dict(
-            reconstruction_points=reconstruction_points[index].detach(),
+            reconstruction_points_vggt=(
+                reconstruction_points_vggt[index].detach()),
             reconstruction_scores=foreground_scores_2d[index].detach(),
             reconstruction_labels=foreground_labels_2d[index].detach(),
-            boxes_before_nms=torch.cat([
-                reconstruction_outputs['bbox_centers_aligned'].reshape(
-                    batch_size, num_views * query_count, 3)[index][valid],
-                reconstruction_outputs['bbox_sizes_aligned'].reshape(
-                    batch_size, num_views * query_count, 3)[index][valid]], dim=-1).detach(),
+            boxes_before_nms_vggt=torch.cat([
+                candidate_centers_vggt[index][valid],
+                candidate_sizes_vggt[index][valid]], dim=-1).detach(),
             labels_before_nms=reconstruction_outputs['bbox_labels'].reshape(
                 batch_size, num_views * query_count)[index][valid].detach(),
-            boxes_after_nms=torch.cat([
-                selected['query_xyz'][index][real],
-                selected['query_size'][index][real]], dim=-1).detach(),
+            boxes_after_nms_vggt=torch.cat([
+                selected['query_xyz_vggt'][index][real],
+                selected['query_size_vggt'][index][real]], dim=-1).detach(),
             labels_after_nms=selected['labels'][index][real].detach(),
-            fallback_boxes=torch.cat([
-                selected['query_xyz'][index][fallback],
-                selected['query_size'][index][fallback]], dim=-1).detach()))
+            fallback_boxes_vggt=torch.cat([
+                selected['query_xyz_vggt'][index][fallback],
+                selected['query_size_vggt'][index][fallback]], dim=-1).detach()))
         return selected
 
     def _predict_reconstruction_objects(self, reconstruction_outputs):
@@ -449,21 +431,16 @@ class ReconDet(Base3DDetector):
         return losses
 
     def get_box_features(self, feature_maps, batch_inputs_dict, images,
-                         query_xyz, query, extrinsics, intrinsics):
-        query_xyz = query_xyz.to(device=images.device, dtype=images.dtype)
+                         query_xyz_vggt, query, raw_extrinsics, intrinsics):
+        query_xyz_vggt = query_xyz_vggt.to(
+            device=images.device, dtype=images.dtype)
         query = query.to(device=images.device, dtype=feature_maps[0].dtype)
-        reference_points, reference_min, reference_max = normalize_query_points(
-            query_xyz, self.query_xyz_range)
-        batch_inputs_dict['query_xyz'] = query_xyz
-        batch_inputs_dict['reference_min'] = reference_min
-        batch_inputs_dict['reference_max'] = reference_max
+        batch_inputs_dict['query_xyz_vggt'] = query_xyz_vggt
         return self.decoder(
             query,
             feature_maps,
-            reference_points,
-            reference_min,
-            reference_max,
-            extrinsics,
+            query_xyz_vggt,
+            raw_extrinsics,
             intrinsics,
             images.shape[-2:],
             self.pos_embedding,
@@ -484,7 +461,7 @@ class ReconDet(Base3DDetector):
             batch_inputs_dict, batch_data_samples, 'train')
         vggt_feature_maps = self.feature_projector(
             vggt_token_list, img, ps_idx)
-        raw_extrinsics, extrinsics, intrinsics, pose_encoding = (
+        raw_extrinsics, intrinsics, pose_encoding = (
             self._build_projection_cameras(
                 vggt_token_list, ps_idx, img, batch_inputs_dict,
                 batch_data_samples, return_pose_encoding=True))
@@ -517,22 +494,21 @@ class ReconDet(Base3DDetector):
             batch_inputs_dict)
         losses.update({f'gdino_{name}': value
                        for name, value in object_losses.items()})
-        reconstruction_outputs = self._align_reconstruction_outputs(
-            reconstruction_outputs, batch_inputs_dict, img)
         selected = self._select_reconstruction_boxes(
-            reconstruction_outputs, img, batch_data_samples)
-        query_xyz = selected['query_xyz']
-        query_size = selected['query_size']
+            reconstruction_outputs, img, batch_data_samples,
+            batch_inputs_dict)
+        query_xyz_vggt = selected['query_xyz_vggt']
+        query_size_vggt = selected['query_size_vggt']
         query = selected['detection_query']
         box_features, refined_query_xyz = self.get_box_features(
-            vggt_feature_maps, batch_inputs_dict, img, query_xyz, query,
-            extrinsics, intrinsics)
+            vggt_feature_maps, batch_inputs_dict, img, query_xyz_vggt, query,
+            raw_extrinsics, intrinsics)
         detection_losses = self.bbox_head.loss(
             box_features,
             batch_data_samples,
             batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
-            initial_query_sizes=query_size,
+            initial_query_sizes=query_size_vggt,
             **kwargs)
         losses.update({f'recondet_{name}': value
                        for name, value in detection_losses.items()})
@@ -550,7 +526,7 @@ class ReconDet(Base3DDetector):
             batch_inputs_dict, batch_data_samples, 'test')
         vggt_feature_maps = self.feature_projector(
             vggt_token_list, img, ps_idx)
-        raw_extrinsics, extrinsics, intrinsics = self._build_projection_cameras(
+        raw_extrinsics, intrinsics = self._build_projection_cameras(
             vggt_token_list, ps_idx, img, batch_inputs_dict,
             batch_data_samples)
         reconstruction_outputs, _ = (
@@ -559,28 +535,28 @@ class ReconDet(Base3DDetector):
                 vggt_feature_maps, raw_extrinsics, intrinsics))
         reconstruction_outputs = self._predict_reconstruction_objects(
             reconstruction_outputs)
-        reconstruction_outputs = self._align_reconstruction_outputs(
-            reconstruction_outputs, batch_inputs_dict, img)
         selected = self._select_reconstruction_boxes(
-            reconstruction_outputs, img, batch_data_samples)
-        query_xyz = selected['query_xyz']
-        query_size = selected['query_size']
+            reconstruction_outputs, img, batch_data_samples,
+            batch_inputs_dict)
+        query_xyz_vggt = selected['query_xyz_vggt']
+        query_size_vggt = selected['query_size_vggt']
         query = selected['detection_query']
         box_features, refined_query_xyz = self.get_box_features(
-            vggt_feature_maps, batch_inputs_dict, img, query_xyz, query,
-            extrinsics, intrinsics)
+            vggt_feature_maps, batch_inputs_dict, img, query_xyz_vggt, query,
+            raw_extrinsics, intrinsics)
         results_list = self.bbox_head.predict(
             box_features,
             batch_data_samples,
             batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
-            initial_query_sizes=query_size,
+            initial_query_sizes=query_size_vggt,
             **kwargs)
         if self.prediction_visualization:
             self._save_prediction_visualizations(
                 batch_data_samples, results_list, reconstruction_outputs,
                 num_views=img.shape[1],
-                cluster_diagnostics=selected['diagnostics'])
+                cluster_diagnostics=selected['diagnostics'],
+                batch_inputs_dict=batch_inputs_dict)
         predictions = self.add_pred_to_datasample(batch_data_samples,
                                                   results_list)
         return predictions
@@ -588,12 +564,9 @@ class ReconDet(Base3DDetector):
     @torch.no_grad()
     def _save_prediction_visualizations(self, batch_data_samples, results_list,
                                         reconstruction_outputs, num_views,
-                                        cluster_diagnostics=None):
-        points = reconstruction_outputs['points_aligned']
-        scores = reconstruction_outputs['class_scores_2d'].amax(dim=-1)
-        batch_size = len(batch_data_samples)
-        points = points.reshape(batch_size, num_views, *points.shape[1:])
-        scores = scores.reshape(batch_size, num_views, *scores.shape[1:])
+                                        cluster_diagnostics=None,
+                                        batch_inputs_dict=None):
+        del reconstruction_outputs, num_views
         for batch_index, (sample, result) in enumerate(
                 zip(batch_data_samples, results_list)):
             metadata = sample.metainfo
@@ -601,18 +574,40 @@ class ReconDet(Base3DDetector):
             gt = sample.gt_instances_3d
             scene_id = metadata.get('scene_id', f'scene_{batch_index}')
             diagnostics = cluster_diagnostics[batch_index]
+            pose = self._matrix_item(
+                batch_inputs_dict['pose_matrix'], batch_index)[None]
+            axis_align = self._matrix_item(
+                batch_inputs_dict['axis_align_matrix'], batch_index)[None]
+            scene_scales = batch_inputs_dict['vggt_gt_scale']
+            scene_scale = scene_scales[batch_index:batch_index + 1]
+            reconstruction_points = denormalize_vggt_gt_points(
+                diagnostics['reconstruction_points_vggt'][None, None],
+                pose, axis_align, scene_scale)[0, 0]
+
+            def align_diagnostic_boxes(key):
+                boxes = diagnostics[key]
+                centers, sizes = denormalize_vggt_boxes(
+                    boxes[None, :, :3], boxes[None, :, 3:6],
+                    pose, axis_align, scene_scale)
+                return torch.cat([centers[0], sizes[0]], dim=-1)
+
+            boxes_before_nms = align_diagnostic_boxes(
+                'boxes_before_nms_vggt')
+            boxes_after_nms = align_diagnostic_boxes(
+                'boxes_after_nms_vggt')
+            fallback_boxes = align_diagnostic_boxes('fallback_boxes_vggt')
             save_scene_reconstruction_visualizations(
                     self.prediction_visualization_dir,
                     scene_id,
                     gt_points,
                     gt.bboxes_3d, gt.labels_3d,
-                    diagnostics['reconstruction_points'],
+                    reconstruction_points,
                     diagnostics['reconstruction_labels'],
-                    diagnostics['boxes_before_nms'],
+                    boxes_before_nms,
                     diagnostics['labels_before_nms'],
-                    diagnostics['boxes_after_nms'],
+                    boxes_after_nms,
                     diagnostics['labels_after_nms'],
-                    diagnostics['fallback_boxes'],
+                    fallback_boxes,
                     result.bboxes_3d, result.labels_3d,
                     class_colors=CLASS_COLORS)
             from mmengine.logging import MMLogger
@@ -623,7 +618,7 @@ class ReconDet(Base3DDetector):
                 f'{len(diagnostics["labels_before_nms"])} '
                 f'reconstruction_after_nms='
                 f'{len(diagnostics["labels_after_nms"])} '
-                f'fallback_boxes={len(diagnostics["fallback_boxes"])} '
+                f'fallback_boxes={len(diagnostics["fallback_boxes_vggt"])} '
                 f'final_detection_boxes={len(result.labels_3d)}')
 
     def _forward(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
@@ -635,7 +630,7 @@ class ReconDet(Base3DDetector):
             batch_inputs_dict, batch_data_samples, 'train')
         vggt_feature_maps = self.feature_projector(
             vggt_token_list, img, ps_idx)
-        raw_extrinsics, extrinsics, intrinsics = self._build_projection_cameras(
+        raw_extrinsics, intrinsics = self._build_projection_cameras(
             vggt_token_list, ps_idx, img, batch_inputs_dict,
             batch_data_samples)
 
@@ -645,18 +640,17 @@ class ReconDet(Base3DDetector):
                 vggt_feature_maps, raw_extrinsics, intrinsics))
         reconstruction_outputs = self._predict_reconstruction_objects(
             reconstruction_outputs)
-        reconstruction_outputs = self._align_reconstruction_outputs(
-            reconstruction_outputs, batch_inputs_dict, img)
         selected = self._select_reconstruction_boxes(
-            reconstruction_outputs, img, batch_data_samples)
-        query_xyz = selected['query_xyz']
-        query_size = selected['query_size']
+            reconstruction_outputs, img, batch_data_samples,
+            batch_inputs_dict)
+        query_xyz_vggt = selected['query_xyz_vggt']
+        query_size_vggt = selected['query_size_vggt']
         query = selected['detection_query']
         box_features, refined_query_xyz = self.get_box_features(
-            vggt_feature_maps, batch_inputs_dict, img, query_xyz, query,
-            extrinsics, intrinsics)
+            vggt_feature_maps, batch_inputs_dict, img, query_xyz_vggt, query,
+            raw_extrinsics, intrinsics)
 
         results = self.bbox_head.forward(
             box_features, batch_inputs_dict, refined_query_xyz,
-            initial_query_sizes=query_size)
+            initial_query_sizes=query_size_vggt)
         return results

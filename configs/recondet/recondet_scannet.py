@@ -25,7 +25,6 @@ grounding_dino_classes = [
 
 _token_dim_ = 512
 _decoder_layer_num = 4
-_query_xyz_range_ = [-6.5, -9.0, -1.0, 6.5, 9.0, 4.5]
 model = dict(
     type='ReconDet',
     vggt_omega_checkpoint=vggt_omega_checkpoint,
@@ -59,7 +58,6 @@ model = dict(
     reconstruction_nms_cfg=dict(
         iou_thr=0.5,
         foreground_score_thr=0.1),
-    query_xyz_range=_query_xyz_range_,
     gt_points_dir=gt_points_dir,
     supervise_2d_bbox=False,
     train_2d_only=False,
@@ -139,7 +137,6 @@ model = dict(
         if_v2_head=True,
         matcher='repeated_hungarian',
         gt_repeat_num=5,
-        center_range=_query_xyz_range_,
         size_logit_range=(-5.0, 5.0),
         loss_layer_ids=list(range(_decoder_layer_num))
     ),

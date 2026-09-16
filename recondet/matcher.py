@@ -58,7 +58,6 @@ class RepeatedHungarianMatcher(nn.Module):
     def __init__(self,
                  cost_weights=None,
                  gt_repeat_num=5,
-                 center_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
                  focal_alpha=0.25,
                  focal_gamma=2.0):
         super().__init__()
@@ -69,16 +68,8 @@ class RepeatedHungarianMatcher(nn.Module):
             raise ValueError(f'cost_weights must contain exactly {required}')
         if gt_repeat_num < 1:
             raise ValueError('gt_repeat_num must be positive')
-        if len(center_range) != 6:
-            raise ValueError('center_range must contain six values')
-        center_range = torch.tensor(center_range, dtype=torch.float32)
-        center_extent = center_range[3:] - center_range[:3]
-        if not torch.isfinite(center_range).all() or (center_extent <= 0).any():
-            raise ValueError('center_range must be finite and increasing')
         self.cost_weights = dict(cost_weights)
         self.gt_repeat_num = int(gt_repeat_num)
-        self.register_buffer('center_min', center_range[:3], persistent=False)
-        self.register_buffer('center_extent', center_extent, persistent=False)
         self.focal_alpha = float(focal_alpha)
         self.focal_gamma = float(focal_gamma)
 
@@ -133,12 +124,7 @@ class RepeatedHungarianMatcher(nn.Module):
         repeated_sizes = gt_sizes[repeated_gt_indices]
         repeated_labels = gt_labels[repeated_gt_indices]
 
-        center_min = self.center_min.to(pred_centers)
-        center_extent = self.center_extent.to(pred_centers)
-        pred_centers_normalized = (pred_centers - center_min) / center_extent
-        gt_centers_normalized = (repeated_centers - center_min) / center_extent
-        cost_center = torch.cdist(
-            pred_centers_normalized, gt_centers_normalized, p=1)
+        cost_center = torch.cdist(pred_centers, repeated_centers, p=1)
         cost_size = torch.cdist(
             pred_size_logs, repeated_sizes.clamp_min(1e-5).log(), p=1)
         cost_class = self._focal_cost(pred_logits, repeated_labels)

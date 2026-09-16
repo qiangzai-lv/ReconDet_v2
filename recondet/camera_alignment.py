@@ -79,7 +79,7 @@ def denormalize_vggt_gt_points(points, first_frame_pose, axis_align_matrix,
 
 def aligned_boxes_to_vggt(centers, sizes, first_frame_pose,
                           axis_align_matrix, scene_scale):
-    """Convert aligned metric AABBs to AABBs in normalized VGGT axes."""
+    """Normalize aligned box centers and axis-aligned size targets."""
     if centers.ndim != 2 or centers.shape[-1] != 3:
         raise ValueError('box centers must have shape [G, 3]')
     if sizes.shape != centers.shape:
@@ -91,23 +91,22 @@ def aligned_boxes_to_vggt(centers, sizes, first_frame_pose,
 
     reference = centers.new_empty((1, 0, 3))
     with torch.autocast(device_type=centers.device.type, enabled=False):
-        _, normalized_to_aligned, _ = _gt_inverse_components(
+        _, normalized_to_aligned, scales = _gt_inverse_components(
             reference, first_frame_pose, axis_align_matrix, scene_scale)
         aligned_to_vggt = torch.linalg.inv(normalized_to_aligned)[0]
         linear = aligned_to_vggt[:3, :3]
         centers_vggt = torch.einsum(
             'ij,gj->gi', linear, centers.float())
         centers_vggt = centers_vggt + aligned_to_vggt[:3, 3]
-        sizes_vggt = torch.einsum(
-            'ij,gj->gi', linear.abs(), sizes.float())
+        sizes_vggt = sizes.float() / scales[0]
     return centers_vggt, sizes_vggt
 
 
 def denormalize_vggt_boxes(centers, sizes, first_frame_pose,
                            axis_align_matrix, scene_scale):
-    """Convert normalized VGGT AABBs to aligned metric AABBs."""
-    if centers.ndim != 4 or centers.shape[-1] != 3:
-        raise ValueError('box centers must have shape [B, V, Q, 3]')
+    """Align centers and restore axis-aligned size targets to metric scale."""
+    if centers.ndim < 3 or centers.shape[-1] != 3:
+        raise ValueError('box centers must have shape [B, ..., 3]')
     if sizes.shape != centers.shape:
         raise ValueError('box sizes must match box centers')
     if not torch.isfinite(centers).all() or not torch.isfinite(sizes).all():
@@ -116,15 +115,17 @@ def denormalize_vggt_boxes(centers, sizes, first_frame_pose,
         raise ValueError('box sizes must be positive')
 
     with torch.autocast(device_type=centers.device.type, enabled=False):
-        _, normalized_to_aligned, _ = _gt_inverse_components(
+        _, normalized_to_aligned, scales = _gt_inverse_components(
             centers, first_frame_pose, axis_align_matrix, scene_scale)
         linear = normalized_to_aligned[:, :3, :3]
         centers_aligned = torch.einsum(
-            'bij,bvqj->bvqi', linear, centers.float())
+            'bij,b...j->b...i', linear, centers.float())
+        translation_shape = (
+            centers.shape[0], *([1] * (centers.ndim - 2)), 3)
         centers_aligned = centers_aligned + normalized_to_aligned[
-            :, None, None, :3, 3]
-        sizes_aligned = torch.einsum(
-            'bij,bvqj->bvqi', linear.abs(), sizes.float())
+            :, :3, 3].reshape(translation_shape)
+        scale_shape = (centers.shape[0], *([1] * (centers.ndim - 2)), 1)
+        sizes_aligned = sizes.float() * scales.reshape(scale_shape)
     return centers_aligned, sizes_aligned
 
 
@@ -352,19 +353,3 @@ def load_axis_aligned_points(path, num_point_features, axis_align_matrix):
         raise ValueError('axis_align_matrix must have shape [4, 4]')
     return (points @ axis_align_matrix[:3, :3].T +
             axis_align_matrix[:3, 3])
-
-
-def normalize_query_points(query_xyz, query_xyz_range, eps=1e-5):
-    query_range = query_xyz.new_tensor(query_xyz_range, dtype=torch.float32)
-    if query_range.numel() != 6:
-        raise ValueError('query_xyz_range must contain 6 values')
-    query_range = query_range.reshape(2, 3)
-    if not torch.isfinite(query_range).all():
-        raise ValueError('query_xyz_range must be finite')
-    if (query_range[1] <= query_range[0]).any():
-        raise ValueError('query_xyz_range maximums must exceed minimums')
-    reference_min = query_range[0].unsqueeze(0).expand(query_xyz.shape[0], -1)
-    reference_max = query_range[1].unsqueeze(0).expand(query_xyz.shape[0], -1)
-    references = ((query_xyz.float() - reference_min[:, None]) /
-                  (reference_max - reference_min)[:, None])
-    return references.clamp(eps, 1.0 - eps), reference_min, reference_max

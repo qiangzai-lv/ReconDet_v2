@@ -50,20 +50,20 @@ def _weighted_fps(points, scores, selected_points, count):
 
 def select_reconstruction_boxes(
         reconstruction_outputs, batch_size, num_views, num_queries,
-        query_xyz_range, nms_iou_thr, logger, scene_ids=None,
+        nms_iou_thr, logger, scene_ids=None,
         foreground_score_thr=0.1):
     """Select fixed-count scene proposals from reconstruction AABBs."""
-    required = (
-        'bbox_centers_aligned', 'bbox_sizes_aligned', 'bbox_scores',
+    per_query_keys = (
+        'bbox_centers_vggt', 'bbox_sizes_vggt', 'bbox_scores',
         'bbox_labels', 'class_scores_2d', 'fused_detection_query',
-        'points_aligned', 'valid_mask')
+        'points_vggt', 'valid_mask', 'nms_centers_aligned',
+        'nms_sizes_aligned')
+    required = per_query_keys + ('fallback_size_vggt',)
     missing = [key for key in required if key not in reconstruction_outputs]
     if missing:
         raise KeyError(f'Missing reconstruction outputs: {missing}')
     if min(batch_size, num_views, num_queries) <= 0:
         raise ValueError('batch_size, num_views and num_queries must be positive')
-    if len(query_xyz_range) != 6:
-        raise ValueError('query range must have 6 values')
     if not 0 <= nms_iou_thr <= 1:
         raise ValueError('NMS IoU threshold must be within [0, 1]')
     if not 0 <= foreground_score_thr <= 1:
@@ -76,19 +76,23 @@ def select_reconstruction_boxes(
     query_count = valid_mask.shape[1]
     query_dims = reconstruction_outputs['fused_detection_query'].shape[-1]
     expected_prefix = (expected_views, query_count)
-    for key in required:
+    for key in per_query_keys:
         if reconstruction_outputs[key].shape[:2] != expected_prefix:
             raise ValueError(f'{key} must begin with [B * V, Q]')
 
-    centers = reconstruction_outputs['bbox_centers_aligned'].reshape(
+    centers = reconstruction_outputs['bbox_centers_vggt'].reshape(
         batch_size, num_views * query_count, 3)
-    sizes = reconstruction_outputs['bbox_sizes_aligned'].reshape_as(centers)
+    sizes = reconstruction_outputs['bbox_sizes_vggt'].reshape_as(centers)
+    nms_centers = reconstruction_outputs['nms_centers_aligned'].reshape_as(
+        centers)
+    nms_sizes = reconstruction_outputs['nms_sizes_aligned'].reshape_as(centers)
+    default_fallback_sizes = reconstruction_outputs['fallback_size_vggt']
     scores = reconstruction_outputs['bbox_scores'].reshape(
         batch_size, num_views * query_count)
     labels = reconstruction_outputs['bbox_labels'].reshape_as(scores).long()
     queries = reconstruction_outputs['fused_detection_query'].reshape(
         batch_size, num_views * query_count, query_dims)
-    reconstruction_points = reconstruction_outputs['points_aligned'].reshape(
+    reconstruction_points = reconstruction_outputs['points_vggt'].reshape(
         batch_size, num_views * query_count, 3)
     class_scores_2d = reconstruction_outputs['class_scores_2d'].reshape(
         batch_size, num_views * query_count, -1)
@@ -98,19 +102,24 @@ def select_reconstruction_boxes(
     valid = valid_mask.reshape(
         batch_size, num_views * query_count).bool().clone()
 
-    xyz_range = centers.new_tensor(query_xyz_range)
-    xyz_min, xyz_max = xyz_range[:3], xyz_range[3:]
     valid &= torch.isfinite(centers).all(dim=-1)
     valid &= torch.isfinite(sizes).all(dim=-1)
+    valid &= torch.isfinite(nms_centers).all(dim=-1)
+    valid &= torch.isfinite(nms_sizes).all(dim=-1)
     valid &= torch.isfinite(scores)
     valid &= torch.isfinite(queries).all(dim=-1)
     valid &= torch.isfinite(reconstruction_points).all(dim=-1)
     valid &= (sizes > 0).all(dim=-1)
-    valid &= (centers >= xyz_min).all(dim=-1)
-    valid &= (centers <= xyz_max).all(dim=-1)
-    geometry_valid = valid & torch.isfinite(foreground_scores_2d)
+    valid &= (nms_sizes > 0).all(dim=-1)
     valid &= torch.isfinite(foreground_scores_2d)
     valid &= foreground_scores_2d >= foreground_score_thr
+    fallback_valid = valid_mask.reshape(
+        batch_size, num_views * query_count).bool().clone()
+    fallback_valid &= torch.isfinite(sizes).all(dim=-1)
+    fallback_valid &= (sizes > 0).all(dim=-1)
+    fallback_valid &= torch.isfinite(queries).all(dim=-1)
+    fallback_valid &= torch.isfinite(reconstruction_points).all(dim=-1)
+    fallback_valid &= torch.isfinite(foreground_scores_2d)
 
     output_centers = []
     output_sizes = []
@@ -125,8 +134,8 @@ def select_reconstruction_boxes(
         candidate_scores = scores[batch_id, candidate_indices].detach()
         if candidate_indices.numel():
             candidate_boxes = _center_size_to_minmax(
-                centers[batch_id, candidate_indices].detach(),
-                sizes[batch_id, candidate_indices].detach())
+                nms_centers[batch_id, candidate_indices].detach(),
+                nms_sizes[batch_id, candidate_indices].detach())
             local_keep = aligned_3d_nms(
                 candidate_boxes, candidate_scores,
                 labels[batch_id, candidate_indices].detach(), nms_iou_thr)
@@ -152,34 +161,61 @@ def select_reconstruction_boxes(
             fallback_pool = candidate_indices
             if fallback_pool.numel() == 0:
                 fallback_pool = torch.nonzero(
-                    geometry_valid[batch_id], as_tuple=False).flatten()
-            remaining = fallback_pool[~torch.isin(fallback_pool,
-                                                   selected_indices)]
+                    fallback_valid[batch_id], as_tuple=False).flatten()
+            remaining = fallback_pool[
+                ~torch.isin(fallback_pool, selected_indices)]
             if remaining.numel() == 0:
                 remaining = fallback_pool
-            fallback_indices = _weighted_fps(
-                reconstruction_points[batch_id, remaining],
-                foreground_scores_2d[batch_id, remaining],
-                reconstruction_points[batch_id, selected_indices],
-                fallback_count)
-            fallback_source_indices = remaining[fallback_indices]
+            if remaining.numel():
+                fallback_indices = _weighted_fps(
+                    reconstruction_points[batch_id, remaining],
+                    foreground_scores_2d[batch_id, remaining],
+                    reconstruction_points[batch_id, selected_indices],
+                    fallback_count)
+                fallback_source_indices = remaining[fallback_indices]
+                fallback_centers = reconstruction_points[
+                    batch_id, fallback_source_indices].detach()
+                fallback_sizes_for_scene = sizes[
+                    batch_id, fallback_source_indices].detach()
+                fallback_queries = queries[
+                    batch_id, fallback_source_indices].detach()
+                fallback_scores = scores[
+                    batch_id, fallback_source_indices].detach()
+                fallback_scores = torch.where(
+                    torch.isfinite(fallback_scores), fallback_scores,
+                    foreground_scores_2d[
+                        batch_id, fallback_source_indices].detach())
+                fallback_labels = labels[
+                    batch_id, fallback_source_indices].detach()
+            else:
+                fallback_source_indices = torch.full(
+                    (fallback_count,), -1, dtype=torch.long,
+                    device=centers.device)
+                fallback_centers = centers.new_zeros(fallback_count, 3)
+                fallback_sizes_for_scene = default_fallback_sizes[
+                    batch_id].expand(fallback_count, -1)
+                fallback_queries = queries.new_zeros(
+                    fallback_count, query_dims)
+                fallback_scores = scores.new_zeros(fallback_count)
+                fallback_labels = labels.new_zeros(fallback_count)
+                scene_id = (
+                    batch_id if scene_ids is None else scene_ids[batch_id])
+                logger.error(
+                    'No finite reconstruction data for weighted FPS; using '
+                    f'deterministic VGGT-origin fallback: scene={scene_id} '
+                    f'fallback={fallback_count}')
             selected_centers = torch.cat(
-                [selected_centers,
-                 centers[batch_id, fallback_source_indices].detach()], dim=0)
+                [selected_centers, fallback_centers], dim=0)
             selected_sizes = torch.cat(
-                [selected_sizes,
-                 sizes[batch_id, fallback_source_indices].detach()], dim=0)
+                [selected_sizes, fallback_sizes_for_scene], dim=0)
             selected_queries = torch.cat([
-                selected_queries,
-                queries[batch_id, fallback_source_indices].detach()
+                selected_queries, fallback_queries
             ], dim=0)
             selected_scores = torch.cat([
-                selected_scores,
-                scores[batch_id, fallback_source_indices].detach()
+                selected_scores, fallback_scores
             ])
             selected_labels = torch.cat([
-                selected_labels,
-                labels[batch_id, fallback_source_indices].detach()
+                selected_labels, fallback_labels
             ])
             source_indices = torch.cat([
                 source_indices, fallback_source_indices.detach()
@@ -203,8 +239,8 @@ def select_reconstruction_boxes(
         output_fallback_masks.append(fallback_mask)
 
     return {
-        'query_xyz': torch.stack(output_centers),
-        'query_size': torch.stack(output_sizes),
+        'query_xyz_vggt': torch.stack(output_centers),
+        'query_size_vggt': torch.stack(output_sizes),
         'detection_query': torch.stack(output_queries),
         'scores': torch.stack(output_scores),
         'labels': torch.stack(output_labels),

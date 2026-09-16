@@ -17,6 +17,7 @@ from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
 from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
                                         OptConfigType, OptInstanceList)
+from recondet.camera_alignment import denormalize_vggt_boxes
 from recondet.matcher import RepeatedHungarianMatcher
 
 
@@ -57,20 +58,6 @@ def decode_size_residuals(size_residuals, initial_query_sizes,
     return reference_logs, predicted_logs, predicted_sizes
 
 
-def matched_size_residual_loss(size_residuals, size_reference_logs, gt_sizes,
-                               pred_indices, gt_indices, avg_factor):
-    """L1 loss against the matched log ratio to the detached reference."""
-    if pred_indices.numel() == 0:
-        return size_residuals.sum() * 0.0
-    target_residuals = (
-        gt_sizes[gt_indices].clamp_min(1e-5).log()
-        - size_reference_logs[pred_indices])
-    loss = F.l1_loss(
-        size_residuals[pred_indices], target_residuals, reduction='sum')
-    return loss / max(float(avg_factor), 1.0)
-
-
-
 @MODELS.register_module()
 class ReconDetHead(BaseModule):
 
@@ -96,7 +83,6 @@ class ReconDetHead(BaseModule):
                  matcher='repeated_hungarian',
                  loss_layer_ids=None,
                  gt_repeat_num=5,
-                 center_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
                  size_logit_range=(-10.0, 10.0),
                  ):
         super(ReconDetHead, self).__init__(init_cfg)
@@ -133,14 +119,12 @@ class ReconDetHead(BaseModule):
             raise ValueError('matcher must be repeated_hungarian')
         self.matcher = RepeatedHungarianMatcher(
             cost_weights=matcher_cost_weights,
-            gt_repeat_num=gt_repeat_num,
-            center_range=center_range)
+            gt_repeat_num=gt_repeat_num)
         self.loss_weights = loss_weights
         if len(size_logit_range) != 2 or size_logit_range[0] >= size_logit_range[1]:
             raise ValueError('size_logit_range must be an increasing pair')
         self.size_logit_range = tuple(float(value) for value in size_logit_range)
         self.gt_repeat_num = int(gt_repeat_num)
-        self.center_range = tuple(float(value) for value in center_range)
         if loss_layer_ids is None:
             loss_layer_ids = list(range(n_levels))
         self.loss_layer_ids = sorted(set(loss_layer_ids))
@@ -218,6 +202,36 @@ class ReconDetHead(BaseModule):
             size_log_preds=size_log_preds,
             cls_preds=cls_preds)
 
+    @staticmethod
+    def _align_detection_outputs(outputs, batch_inputs_dict):
+        required = ('pose_matrix', 'axis_align_matrix', 'vggt_gt_scale')
+        missing = [key for key in required if key not in batch_inputs_dict]
+        if missing:
+            raise KeyError(
+                f'Missing VGGT-to-aligned transform inputs: {missing}')
+
+        aligned_outputs = dict(outputs)
+        aligned_centers = []
+        aligned_sizes = []
+        aligned_size_logs = []
+        for centers_vggt, sizes_vggt in zip(
+                outputs['center_preds'], outputs['size_preds']):
+            centers, sizes = denormalize_vggt_boxes(
+                centers_vggt.transpose(1, 2),
+                sizes_vggt.transpose(1, 2),
+                batch_inputs_dict['pose_matrix'],
+                batch_inputs_dict['axis_align_matrix'],
+                batch_inputs_dict['vggt_gt_scale'])
+            centers = centers.transpose(1, 2)
+            sizes = sizes.transpose(1, 2)
+            aligned_centers.append(centers)
+            aligned_sizes.append(sizes)
+            aligned_size_logs.append(sizes.clamp_min(1e-5).log())
+        aligned_outputs['center_preds'] = aligned_centers
+        aligned_outputs['size_preds'] = aligned_sizes
+        aligned_outputs['size_log_preds'] = aligned_size_logs
+        return aligned_outputs
+
     def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
              batch_inputs_dict: dict, refined_query_xyz=None,
              initial_query_sizes=None, **kwargs) -> dict:
@@ -226,6 +240,7 @@ class ReconDetHead(BaseModule):
         layer_ids = self.loss_layer_ids
         outputs = self(
             x, batch_inputs_dict, refined_query_xyz, initial_query_sizes)
+        outputs = self._align_detection_outputs(outputs, batch_inputs_dict)
 
         if 'points' in batch_inputs_dict.keys():
             batch_input_points = batch_inputs_dict['points']
@@ -243,8 +258,6 @@ class ReconDetHead(BaseModule):
 
         loss_inputs = (
                        outputs['center_preds'], outputs['size_preds'],
-                       outputs['size_residual_preds'],
-                       outputs['size_reference_logs'],
                        outputs['size_log_preds'], outputs['cls_preds'], layer_ids,
                        batch_gt_instances_3d, batch_input_metas,
                        batch_input_points, batch_gt_instances_ignore)
@@ -254,8 +267,6 @@ class ReconDetHead(BaseModule):
     def loss_by_feat(self,
                      center_preds: List[List[Tensor]],
                      size_preds: List[List[Tensor]],
-                     size_residual_preds: List[List[Tensor]],
-                     size_reference_logs: List[List[Tensor]],
                      size_log_preds: List[List[Tensor]],
                      cls_preds: List[List[Tensor]],
                      layer_ids: List[int],
@@ -296,10 +307,6 @@ class ReconDetHead(BaseModule):
                     self._loss_by_feat_single(
                         center_pred=center_preds[layer_id][batch_id],
                         size_pred=size_preds[layer_id][batch_id],
-                        size_residual_pred=(
-                            size_residual_preds[layer_id][batch_id]),
-                        size_reference_log=(
-                            size_reference_logs[layer_id][batch_id]),
                         size_log_pred=size_log_preds[layer_id][batch_id],
                         cls_pred=cls_preds[layer_id][batch_id],
                         input_meta=batch_input_metas[batch_id],
@@ -329,15 +336,12 @@ class ReconDetHead(BaseModule):
         return loss_dict
 
     def _loss_by_feat_single(self, center_pred, size_pred,
-                             size_residual_pred, size_reference_log,
                              size_log_pred, cls_pred, input_meta,
                              gt_bboxes, gt_labels, input_points,
                              match_indices=None, avg_factor=None):
         del input_meta, input_points
         centers = center_pred.t()
         sizes = size_pred.t()
-        size_residuals = size_residual_pred.t()
-        size_reference_logs = size_reference_log.t()
         size_logs = size_log_pred.t()
         cls_scores = cls_pred.t()
         gt_centers = gt_bboxes.gravity_center
@@ -361,22 +365,20 @@ class ReconDetHead(BaseModule):
             cls_scores, cls_target, avg_factor=avg_factor)
         cls_loss = cls_loss * self.loss_weights['cls_loss']
 
-        size_loss = matched_size_residual_loss(
-            size_residuals, size_reference_logs, gt_sizes,
-            pred_indices, gt_indices, avg_factor)
+        if pred_indices.numel() == 0:
+            size_loss = size_logs.sum() * 0.0
+        else:
+            size_loss = F.l1_loss(
+                size_logs[pred_indices],
+                gt_sizes[gt_indices].clamp_min(1e-5).log(),
+                reduction='sum') / max(float(avg_factor), 1.0)
         size_loss = size_loss * self.loss_weights['size_loss']
         if pred_indices.numel() == 0:
             center_loss = centers.sum() * 0.0
             giou_loss = sizes.sum() * 0.0
         else:
-            center_min = self.matcher.center_min.to(centers)
-            center_extent = self.matcher.center_extent.to(centers)
-            matched_centers = (
-                centers[pred_indices] - center_min) / center_extent
-            matched_gt_centers = (
-                gt_centers[gt_indices] - center_min) / center_extent
             center_loss = F.l1_loss(
-                matched_centers, matched_gt_centers,
+                centers[pred_indices], gt_centers[gt_indices],
                 reduction='sum') / avg_factor
 
             pred_tp_bbox = self._center_size_pred_to_bbox(
@@ -404,6 +406,7 @@ class ReconDetHead(BaseModule):
         outputs = self(
             x, batch_inputs_dict, refined_query_xyz,
             initial_query_sizes, layer_ids)
+        outputs = self._align_detection_outputs(outputs, batch_inputs_dict)
         predictions = self.predict_by_feat(
             [outputs['center_preds'][-1]],
             [outputs['size_preds'][-1]],

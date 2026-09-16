@@ -9,8 +9,7 @@ from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
 from recondet.camera_alignment import (
-    denormalize_vggt_boxes, denormalize_vggt_gt_cameras,
-    denormalize_vggt_gt_points,
+    denormalize_vggt_gt_cameras, denormalize_vggt_gt_points,
     load_axis_aligned_points, normalize_query_points)
 from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
@@ -18,7 +17,7 @@ from recondet.device import autocast, get_device
 from recondet.feature_projection import VGGTFeatureProjector
 from recondet.geometry_attention import GeometryAwareDeformableDecoder
 from recondet.grounding_dino_encoder import GroundingDINOSemanticEncoder
-from recondet.query_correspondence import select_reconstruction_boxes
+from recondet.query_correspondence import IterativeInstanceClustering
 from recondet.reconstruction_object_head import ReconstructionObjectHead
 from recondet.vggt_camera_loss import (
     compute_vggt_camera_loss, VGGT_CAMERA_LOSS_DEFAULTS)
@@ -62,7 +61,7 @@ class ReconDet(Base3DDetector):
             vggt_omega_checkpoint=None,
             vggt_lora_cfg=None,
             deformable_num_points=4,
-            reconstruction_nms_cfg=None,
+            reconstruction_clustering_cfg=None,
             query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
             gt_points_dir=None,
             supervise_2d_bbox=False,
@@ -165,16 +164,15 @@ class ReconDet(Base3DDetector):
         self.test_cfg = test_cfg
 
         self.num_queries = num_queries
-        reconstruction_nms_cfg = dict(reconstruction_nms_cfg or {})
-        unknown_nms_keys = set(reconstruction_nms_cfg) - {
-            'iou_thr', 'foreground_score_thr'}
-        if unknown_nms_keys:
+        reconstruction_clustering_cfg = dict(
+            reconstruction_clustering_cfg or {})
+        configured_clusters = int(reconstruction_clustering_cfg.pop(
+            'num_clusters', self.num_queries))
+        if configured_clusters != self.num_queries:
             raise ValueError(
-                f'Unknown reconstruction NMS keys: {sorted(unknown_nms_keys)}')
-        self.reconstruction_nms_iou_thr = float(
-            reconstruction_nms_cfg.get('iou_thr', 0.25))
-        self.reconstruction_foreground_score_thr = float(
-            reconstruction_nms_cfg.get('foreground_score_thr', 0.1))
+                'Reconstruction cluster count must match num_queries')
+        self.reconstruction_clustering = IterativeInstanceClustering(
+            num_clusters=self.num_queries, **reconstruction_clustering_cfg)
         self.test_only_last_layer = test_only_last_layer
 
         self.pos_embedding = PositionEmbeddingCoordsSine(
@@ -358,94 +356,51 @@ class ReconDet(Base3DDetector):
         outputs = dict(reconstruction_outputs)
         outputs['points_aligned'] = points_aligned.reshape(
             batch_size * num_views, query_count, 3)
-        if ('bbox_centers_vggt' in outputs
-                and 'bbox_sizes_vggt' in outputs):
-            centers_vggt = outputs['bbox_centers_vggt'].reshape(
-                batch_size, num_views, query_count, 3)
-            sizes_vggt = outputs['bbox_sizes_vggt'].reshape_as(centers_vggt)
-            centers_aligned, sizes_aligned = denormalize_vggt_boxes(
-                centers_vggt, sizes_vggt,
-                batch_inputs_dict['pose_matrix'],
-                batch_inputs_dict['axis_align_matrix'],
-                batch_inputs_dict['vggt_gt_scale'])
-            outputs['bbox_centers_aligned'] = centers_aligned.reshape(
-                batch_size * num_views, query_count, 3)
-            outputs['bbox_sizes_aligned'] = sizes_aligned.reshape(
-                batch_size * num_views, query_count, 3)
         return outputs
 
-    def _select_reconstruction_boxes(self, reconstruction_outputs, images,
-                                     batch_data_samples):
+    def _cluster_reconstruction_objects(self, reconstruction_outputs, images):
         batch_size, num_views = images.shape[:2]
-        from mmengine.logging import MMLogger
-        selected = select_reconstruction_boxes(
-            reconstruction_outputs,
-            batch_size=batch_size,
-            num_views=num_views,
-            num_queries=self.num_queries,
-            query_xyz_range=self.query_xyz_range,
-            nms_iou_thr=self.reconstruction_nms_iou_thr,
-            logger=MMLogger.get_current_instance(),
-            scene_ids=[sample.metainfo.get('scene_id', index)
-                       for index, sample in enumerate(batch_data_samples)],
-            foreground_score_thr=self.reconstruction_foreground_score_thr)
-        query_count = reconstruction_outputs['bbox_scores'].shape[1]
-        candidate_centers = reconstruction_outputs[
-            'bbox_centers_aligned'].reshape(
-                batch_size, num_views * query_count, 3)
-        reconstruction_points = reconstruction_outputs[
-            'points_aligned'].reshape(
-                batch_size, num_views * query_count, 3)
+        clustered = self.reconstruction_clustering(
+            reconstruction_outputs, batch_size, num_views)
+        predictions = self.reconstruction_object_head(
+            clustered['cluster_queries_3d'],
+            clustered['cluster_queries_2d'],
+            clustered['cluster_centers'])
+        outputs = dict(reconstruction_outputs)
+        outputs.update(clustered)
+        outputs.update(predictions)
+
+        query_count = reconstruction_outputs['valid_mask'].shape[1]
+        reconstruction_points = reconstruction_outputs['points_aligned'].reshape(
+            batch_size, num_views * query_count, 3)
         class_scores_2d = reconstruction_outputs['class_scores_2d'].reshape(
             batch_size, num_views * query_count, -1)
         foreground_scores_2d, foreground_labels_2d = (
             class_scores_2d.max(dim=-1))
-        selected['diagnostics'] = []
+        boxes = torch.cat([
+            predictions['bbox_centers_aligned'],
+            predictions['bbox_sizes_aligned']], dim=-1)
         for index in range(batch_size):
-            valid = selected['candidate_valid_mask'][index]
-            fallback = selected['fallback_mask'][index]
-            real = ~fallback
-            selected['diagnostics'].append(dict(
-            reconstruction_points=reconstruction_points[index].detach(),
-            reconstruction_scores=foreground_scores_2d[index].detach(),
-            reconstruction_labels=foreground_labels_2d[index].detach(),
-            boxes_before_nms=torch.cat([
-                reconstruction_outputs['bbox_centers_aligned'].reshape(
-                    batch_size, num_views * query_count, 3)[index][valid],
-                reconstruction_outputs['bbox_sizes_aligned'].reshape(
-                    batch_size, num_views * query_count, 3)[index][valid]], dim=-1).detach(),
-            labels_before_nms=reconstruction_outputs['bbox_labels'].reshape(
-                batch_size, num_views * query_count)[index][valid].detach(),
-            boxes_after_nms=torch.cat([
-                selected['query_xyz'][index][real],
-                selected['query_size'][index][real]], dim=-1).detach(),
-            labels_after_nms=selected['labels'][index][real].detach(),
-            fallback_boxes=torch.cat([
-                selected['query_xyz'][index][fallback],
-                selected['query_size'][index][fallback]], dim=-1).detach()))
-        return selected
-
-    def _predict_reconstruction_objects(self, reconstruction_outputs):
-        predictions = self.reconstruction_object_head(
-            reconstruction_outputs['reconstruction_query'],
-            reconstruction_outputs['detection_query_2d'],
-            reconstruction_outputs['points_vggt'])
-        outputs = dict(reconstruction_outputs)
-        outputs.update(predictions)
+            outputs['diagnostics'][index].update(dict(
+                reconstruction_points=reconstruction_points[index].detach(),
+                reconstruction_scores=foreground_scores_2d[index].detach(),
+                reconstruction_labels=foreground_labels_2d[index].detach(),
+                cluster_boxes=boxes[index].detach(),
+                cluster_labels=predictions['bbox_labels'][index].detach()))
         return outputs
 
+    @staticmethod
+    def _detach_detection_queries(reconstruction_outputs):
+        return (
+            reconstruction_outputs['bbox_centers_aligned'].detach(),
+            reconstruction_outputs['bbox_sizes_aligned'].detach(),
+            reconstruction_outputs['fused_detection_query'].detach())
+
     def _compute_reconstruction_object_losses(
-            self, reconstruction_outputs, batch_data_samples, num_views,
-            batch_inputs_dict):
-        matches = reconstruction_outputs.get('reconstruction_matches')
-        if matches is None:
-            raise RuntimeError(
-                'Object reconstruction supervision requires 2D matches')
+            self, reconstruction_outputs, batch_data_samples):
         losses, _ = self.reconstruction_object_head.loss(
-            reconstruction_outputs, matches, batch_data_samples, num_views,
-            first_frame_pose=batch_inputs_dict['pose_matrix'],
-            axis_align_matrix=batch_inputs_dict['axis_align_matrix'],
-            scene_scale=batch_inputs_dict['vggt_gt_scale'])
+            reconstruction_outputs, batch_data_samples,
+            self.bbox_head.matcher, self.bbox_head.loss_weights)
         return losses
 
     def get_box_features(self, feature_maps, batch_inputs_dict, images,
@@ -510,20 +465,16 @@ class ReconDet(Base3DDetector):
                 batch_inputs_dict['gt_depth_valid_masks'],
                 img.shape[-2:],
                 **self.camera_loss_cfg))
-        reconstruction_outputs = self._predict_reconstruction_objects(
-            reconstruction_outputs)
-        object_losses = self._compute_reconstruction_object_losses(
-            reconstruction_outputs, batch_data_samples, img.shape[1],
-            batch_inputs_dict)
-        losses.update({f'gdino_{name}': value
-                       for name, value in object_losses.items()})
         reconstruction_outputs = self._align_reconstruction_outputs(
             reconstruction_outputs, batch_inputs_dict, img)
-        selected = self._select_reconstruction_boxes(
-            reconstruction_outputs, img, batch_data_samples)
-        query_xyz = selected['query_xyz']
-        query_size = selected['query_size']
-        query = selected['detection_query']
+        reconstruction_outputs = self._cluster_reconstruction_objects(
+            reconstruction_outputs, img)
+        object_losses = self._compute_reconstruction_object_losses(
+            reconstruction_outputs, batch_data_samples)
+        losses.update({f'gdino_{name}': value
+                       for name, value in object_losses.items()})
+        query_xyz, query_size, query = self._detach_detection_queries(
+            reconstruction_outputs)
         box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz, query,
             extrinsics, intrinsics)
@@ -557,15 +508,12 @@ class ReconDet(Base3DDetector):
             self.semantic_encoder.predict_reconstruction(
                 batch_inputs_dict['imgs'], batch_data_samples,
                 vggt_feature_maps, raw_extrinsics, intrinsics))
-        reconstruction_outputs = self._predict_reconstruction_objects(
-            reconstruction_outputs)
         reconstruction_outputs = self._align_reconstruction_outputs(
             reconstruction_outputs, batch_inputs_dict, img)
-        selected = self._select_reconstruction_boxes(
-            reconstruction_outputs, img, batch_data_samples)
-        query_xyz = selected['query_xyz']
-        query_size = selected['query_size']
-        query = selected['detection_query']
+        reconstruction_outputs = self._cluster_reconstruction_objects(
+            reconstruction_outputs, img)
+        query_xyz, query_size, query = self._detach_detection_queries(
+            reconstruction_outputs)
         box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz, query,
             extrinsics, intrinsics)
@@ -580,7 +528,7 @@ class ReconDet(Base3DDetector):
             self._save_prediction_visualizations(
                 batch_data_samples, results_list, reconstruction_outputs,
                 num_views=img.shape[1],
-                cluster_diagnostics=selected['diagnostics'])
+                cluster_diagnostics=reconstruction_outputs['diagnostics'])
         predictions = self.add_pred_to_datasample(batch_data_samples,
                                                   results_list)
         return predictions
@@ -601,6 +549,9 @@ class ReconDet(Base3DDetector):
             gt = sample.gt_instances_3d
             scene_id = metadata.get('scene_id', f'scene_{batch_index}')
             diagnostics = cluster_diagnostics[batch_index]
+            cluster_boxes = diagnostics['cluster_boxes']
+            cluster_labels = diagnostics['cluster_labels']
+            empty_boxes = cluster_boxes.new_empty((0, 6))
             save_scene_reconstruction_visualizations(
                     self.prediction_visualization_dir,
                     scene_id,
@@ -608,22 +559,21 @@ class ReconDet(Base3DDetector):
                     gt.bboxes_3d, gt.labels_3d,
                     diagnostics['reconstruction_points'],
                     diagnostics['reconstruction_labels'],
-                    diagnostics['boxes_before_nms'],
-                    diagnostics['labels_before_nms'],
-                    diagnostics['boxes_after_nms'],
-                    diagnostics['labels_after_nms'],
-                    diagnostics['fallback_boxes'],
+                    cluster_boxes,
+                    cluster_labels,
+                    cluster_boxes,
+                    cluster_labels,
+                    empty_boxes,
                     result.bboxes_3d, result.labels_3d,
                     class_colors=CLASS_COLORS)
             from mmengine.logging import MMLogger
             MMLogger.get_current_instance().info(
                 'Prediction visualization box counts: '
                 f'scene={scene_id} gt_boxes={len(gt.labels_3d)} '
-                f'reconstruction_before_nms='
-                f'{len(diagnostics["labels_before_nms"])} '
-                f'reconstruction_after_nms='
-                f'{len(diagnostics["labels_after_nms"])} '
-                f'fallback_boxes={len(diagnostics["fallback_boxes"])} '
+                f'reconstruction_clusters={len(cluster_labels)} '
+                f'cluster_iterations={diagnostics["iterations"]} '
+                f'empty_cluster_resets='
+                f'{diagnostics["empty_cluster_resets"]} '
                 f'final_detection_boxes={len(result.labels_3d)}')
 
     def _forward(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
@@ -643,15 +593,12 @@ class ReconDet(Base3DDetector):
             self.semantic_encoder.predict_reconstruction(
                 batch_inputs_dict['imgs'], batch_data_samples,
                 vggt_feature_maps, raw_extrinsics, intrinsics))
-        reconstruction_outputs = self._predict_reconstruction_objects(
-            reconstruction_outputs)
         reconstruction_outputs = self._align_reconstruction_outputs(
             reconstruction_outputs, batch_inputs_dict, img)
-        selected = self._select_reconstruction_boxes(
-            reconstruction_outputs, img, batch_data_samples)
-        query_xyz = selected['query_xyz']
-        query_size = selected['query_size']
-        query = selected['detection_query']
+        reconstruction_outputs = self._cluster_reconstruction_objects(
+            reconstruction_outputs, img)
+        query_xyz, query_size, query = self._detach_detection_queries(
+            reconstruction_outputs)
         box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz, query,
             extrinsics, intrinsics)

@@ -54,7 +54,6 @@ class ReconDet(Base3DDetector):
             init_cfg: OptConfigType = None,
             g_dino_cfg: OptConfigType = None,
             decoder_cfg: OptConfigType = None,
-            gradient_checkpointing: bool = True,
             num_queries=128,
             token_dim=1024,
             test_only_last_layer=True,

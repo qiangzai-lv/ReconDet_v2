@@ -285,8 +285,9 @@ class GroundingDINO3DDecoderLayer(nn.Module):
 
     def __init__(self, query_dims, spatial_dims, num_heads,
                  feedforward_channels, num_feature_levels, num_points,
-                 dropout=0.0):
+                 dropout=0.0, gradient_checkpointing=True):
         super().__init__()
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self.spatial_attention = ProjectedQueryDeformableAttention(
             query_dims=query_dims,
             value_dims=spatial_dims,
@@ -373,7 +374,8 @@ class GroundingDINO3DDecoderLayer(nn.Module):
                 values_by_view[:, target_view],
                 target_references, ratios_by_view[:, target_view],
                 masks_by_view[:, target_view])
-            if (self.training and torch.is_grad_enabled() and
+            if (self.gradient_checkpointing and self.training and
+                    torch.is_grad_enabled() and
                     (query.requires_grad or spatial_value.requires_grad)):
                 attended = checkpoint(
                     attend_target_view, *attention_inputs,
@@ -422,9 +424,10 @@ class GroundingDINO3DDecoder(nn.Module):
     def __init__(self, num_queries, query_dims=512, semantic_dims=256,
                  spatial_dims=512, num_layers=6, num_heads=8,
                  feedforward_channels=2048, num_feature_levels=4,
-                 num_points=4, dropout=0.0):
+                 num_points=4, dropout=0.0, gradient_checkpointing=True):
         super().__init__()
         self.num_queries = num_queries
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self.semantic_query_projection = nn.Linear(semantic_dims, query_dims)
         self.query_embedding = nn.Embedding(num_queries, query_dims)
         self.init_norm = nn.LayerNorm(query_dims)
@@ -441,7 +444,8 @@ class GroundingDINO3DDecoder(nn.Module):
                 feedforward_channels=feedforward_channels,
                 num_feature_levels=num_feature_levels,
                 num_points=num_points,
-                dropout=dropout)
+                dropout=dropout,
+                gradient_checkpointing=self.gradient_checkpointing)
             for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(query_dims)

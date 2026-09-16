@@ -78,6 +78,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
                  supervise_instance_consistency: bool = False,
                  instance_consistency_cfg=None,
                  scene_query_exchange_cfg=None,
+                 gradient_checkpointing: bool = True,
                  supervise_confident_query_depth: bool = False,
                  confident_query_depth_cfg=None) -> None:
         super().__init__()
@@ -112,6 +113,10 @@ class GroundingDINOSemanticEncoder(nn.Module):
         model_cfg.bbox_head.instance_consistency_cfg = (
             instance_consistency_cfg)
         model_cfg.scene_query_exchange_cfg = scene_query_exchange_cfg
+        reconstruction_decoder_cfg = model_cfg.get('reconstruction_decoder')
+        if reconstruction_decoder_cfg is not None:
+            reconstruction_decoder_cfg.gradient_checkpointing = bool(
+                gradient_checkpointing)
         model_cfg.bbox_head.reconstruction_depth_loss_weight = float(
             reconstruction_depth_loss_weight)
         model_cfg.bbox_head.reconstruction_point_loss_weight = float(

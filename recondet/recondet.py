@@ -54,6 +54,7 @@ class ReconDet(Base3DDetector):
             init_cfg: OptConfigType = None,
             g_dino_cfg: OptConfigType = None,
             decoder_cfg: OptConfigType = None,
+            gradient_checkpointing: bool = True,
             num_queries=128,
             token_dim=1024,
             test_only_last_layer=True,
@@ -84,6 +85,10 @@ class ReconDet(Base3DDetector):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         self.train_2d_only = bool(train_2d_only)
+        gradient_checkpointing = bool(gradient_checkpointing)
+
+        vggt_lora_cfg = dict(vggt_lora_cfg or {})
+        vggt_lora_cfg['gradient_checkpointing'] = gradient_checkpointing
 
         bbox_head.update(train_cfg=train_cfg)
         bbox_head.update(test_cfg=test_cfg)
@@ -129,6 +134,7 @@ class ReconDet(Base3DDetector):
                 supervise_instance_consistency),
             instance_consistency_cfg=instance_consistency_cfg,
             scene_query_exchange_cfg=scene_query_exchange_cfg,
+            gradient_checkpointing=gradient_checkpointing,
             supervise_confident_query_depth=(
                 supervise_confident_query_depth),
             confident_query_depth_cfg=confident_query_depth_cfg)

@@ -4,41 +4,6 @@ import numpy as np
 import torch
 
 
-def _inverse_affine_4x4(matrix):
-    """Invert batched affine transforms without backend linalg kernels."""
-    if matrix.shape[-2:] != (4, 4):
-        raise ValueError('affine matrix must end with shape [4, 4]')
-
-    linear = matrix[..., :3, :3]
-    row0, row1, row2 = linear.unbind(dim=-2)
-    cofactor0 = torch.stack([
-        row1[..., 1] * row2[..., 2] - row1[..., 2] * row2[..., 1],
-        row1[..., 2] * row2[..., 0] - row1[..., 0] * row2[..., 2],
-        row1[..., 0] * row2[..., 1] - row1[..., 1] * row2[..., 0],
-    ], dim=-1)
-    cofactor1 = torch.stack([
-        row2[..., 1] * row0[..., 2] - row2[..., 2] * row0[..., 1],
-        row2[..., 2] * row0[..., 0] - row2[..., 0] * row0[..., 2],
-        row2[..., 0] * row0[..., 1] - row2[..., 1] * row0[..., 0],
-    ], dim=-1)
-    cofactor2 = torch.stack([
-        row0[..., 1] * row1[..., 2] - row0[..., 2] * row1[..., 1],
-        row0[..., 2] * row1[..., 0] - row0[..., 0] * row1[..., 2],
-        row0[..., 0] * row1[..., 1] - row0[..., 1] * row1[..., 0],
-    ], dim=-1)
-    determinant = (row0 * cofactor0).sum(dim=-1)
-    inverse_linear = torch.stack(
-        [cofactor0, cofactor1, cofactor2], dim=-1)
-    inverse_linear = inverse_linear / determinant[..., None, None]
-
-    inverse = torch.zeros_like(matrix)
-    inverse[..., :3, :3] = inverse_linear
-    inverse[..., :3, 3] = -torch.matmul(
-        inverse_linear, matrix[..., :3, 3, None]).squeeze(-1)
-    inverse[..., 3, 3] = 1
-    return inverse
-
-
 def _batch_matrix(value, reference, batch_size, name):
     if isinstance(value, torch.Tensor):
         matrix = value
@@ -128,7 +93,7 @@ def aligned_boxes_to_vggt(centers, sizes, first_frame_pose,
     with torch.autocast(device_type=centers.device.type, enabled=False):
         _, normalized_to_aligned, _ = _gt_inverse_components(
             reference, first_frame_pose, axis_align_matrix, scene_scale)
-        aligned_to_vggt = _inverse_affine_4x4(normalized_to_aligned)[0]
+        aligned_to_vggt = torch.linalg.inv(normalized_to_aligned)[0]
         linear = aligned_to_vggt[:3, :3]
         centers_vggt = torch.einsum(
             'ij,gj->gi', linear, centers.float())
@@ -175,7 +140,7 @@ def denormalize_vggt_gt_cameras(extrinsics, first_frame_pose,
             scale_matrix[:, None], extrinsics_h)
         aligned_extrinsics = torch.matmul(
             metric_camera_extrinsics,
-            _inverse_affine_4x4(normalized_to_aligned)[:, None])
+            torch.linalg.inv(normalized_to_aligned)[:, None])
     if not torch.isfinite(aligned_extrinsics).all():
         raise FloatingPointError('Aligned VGGT extrinsics contain non-finite values')
     return aligned_extrinsics[..., :3, :]
@@ -216,7 +181,7 @@ def align_vggt_cameras(extrinsics, first_frame_pose, axis_align_matrix,
             scale_matrix[:, None], extrinsics_h)
         aligned_extrinsics = torch.matmul(
             scaled_camera_extrinsics,
-            _inverse_affine_4x4(vggt_to_aligned)[:, None])
+            torch.linalg.inv(vggt_to_aligned)[:, None])
 
     if not torch.isfinite(aligned_extrinsics).all():
         raise FloatingPointError('Aligned VGGT extrinsics contain non-finite values')

@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.ops import MultiScaleDeformableAttention
+from mmcv.ops.multi_scale_deform_attn import (
+    MultiScaleDeformableAttnFunction,
+    multi_scale_deformable_attn_pytorch,
+)
+from mmcv.utils import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
 from torch.utils.checkpoint import checkpoint
 
 from mmdet.models.layers.transformer.utils import coordinate_to_encoding
@@ -184,6 +189,97 @@ class ProjectedQueryDeformableAttention(nn.Module):
                 level_start_index=level_start_index)
         return self.output_projection(attended.to(output_dtype))
 
+    def forward_with_shared_value(
+            self, projected_query, query_pos, value, spatial_shapes,
+            level_start_index, reference_points, valid_ratios, value_repeat,
+            key_padding_mask=None, output_dtype=None):
+        """Attend to a target-view value shared by repeated source views."""
+        attention = self.attention
+        batch_size, num_value, _ = value.shape
+        repeated_batch_size = batch_size * value_repeat
+        if projected_query.shape[0] != repeated_batch_size:
+            raise ValueError(
+                'projected query batch must equal value batch * value_repeat')
+        if ((spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() !=
+                num_value):
+            raise ValueError('spatial shapes must cover the shared value')
+        if valid_ratios.shape[0] != batch_size:
+            raise ValueError('valid ratios must match the shared value batch')
+        if (key_padding_mask is not None and
+                key_padding_mask.shape != value.shape[:2]):
+            raise ValueError('key padding mask must match the shared value')
+
+        repeated_ratios = valid_ratios.unsqueeze(1).expand(
+            -1, value_repeat, -1, -1).reshape(
+                repeated_batch_size, self.num_levels, 2)
+        scaled_reference_points = (
+            reference_points[:, :, None] * repeated_ratios[:, None])
+        projected_position = self.position_projection(query_pos)
+        if output_dtype is None:
+            output_dtype = projected_query.dtype
+
+        with torch.autocast(
+                device_type=projected_query.device.type, enabled=False):
+            attention_query = (
+                projected_query.float() + projected_position.float())
+            projected_value = attention.value_proj(value.float())
+            if key_padding_mask is not None:
+                projected_value = projected_value.masked_fill(
+                    key_padding_mask[..., None], 0.0)
+            projected_value = projected_value.view(
+                batch_size, num_value, attention.num_heads, -1)
+            projected_value = projected_value.unsqueeze(1).expand(
+                -1, value_repeat, -1, -1, -1).reshape(
+                    repeated_batch_size, num_value, attention.num_heads,
+                    -1).contiguous()
+
+            num_queries = attention_query.shape[1]
+            sampling_offsets = attention.sampling_offsets(
+                attention_query).view(
+                    repeated_batch_size, num_queries, attention.num_heads,
+                    attention.num_levels, attention.num_points, 2)
+            attention_weights = attention.attention_weights(
+                attention_query).view(
+                    repeated_batch_size, num_queries, attention.num_heads,
+                    attention.num_levels * attention.num_points)
+            attention_weights = attention_weights.softmax(-1).view(
+                repeated_batch_size, num_queries, attention.num_heads,
+                attention.num_levels, attention.num_points)
+
+            if scaled_reference_points.shape[-1] == 2:
+                offset_normalizer = torch.stack(
+                    [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+                sampling_locations = (
+                    scaled_reference_points[:, :, None, :, None, :] +
+                    sampling_offsets /
+                    offset_normalizer[None, None, None, :, None, :])
+            elif scaled_reference_points.shape[-1] == 4:
+                sampling_locations = (
+                    scaled_reference_points[:, :, None, :, None, :2] +
+                    sampling_offsets / attention.num_points *
+                    scaled_reference_points[:, :, None, :, None, 2:] * 0.5)
+            else:
+                raise ValueError(
+                    'Last dim of reference_points must be 2 or 4, but got '
+                    f'{scaled_reference_points.shape[-1]}')
+
+            if ((IS_CUDA_AVAILABLE and projected_value.is_cuda) or
+                    (IS_MLU_AVAILABLE and projected_value.is_mlu) or
+                    (IS_NPU_AVAILABLE and
+                     projected_value.device.type == 'npu')):
+                attended = MultiScaleDeformableAttnFunction.apply(
+                    projected_value, spatial_shapes, level_start_index,
+                    sampling_locations, attention_weights,
+                    attention.im2col_step)
+            else:
+                attended = multi_scale_deformable_attn_pytorch(
+                    projected_value, spatial_shapes, sampling_locations,
+                    attention_weights)
+            attended = attention.output_proj(attended)
+            attended = attention.dropout(attended) + torch.zeros_like(
+                projected_query, dtype=torch.float32)
+        return self.output_projection(attended.to(output_dtype))
+
 
 class GroundingDINO3DDecoderLayer(nn.Module):
 
@@ -252,23 +348,20 @@ class GroundingDINO3DDecoderLayer(nn.Module):
         masks_by_view = spatial_key_padding_mask.reshape(
             batch_size, num_views, sequence_length)
         normalized_query = self.cross_view_norm(query)
+        projected_query = self.cross_view_attention.query_projection(
+            normalized_query)
         cross_view_output = torch.zeros_like(query)
 
-        def attend_target_view(query_input, position_input, target_value_base,
+        def attend_target_view(projected_query_input, position_input,
+                               target_value_base,
                                target_references, target_ratio_base,
                                target_mask_base):
-            target_value = target_value_base.unsqueeze(1).expand(
-                -1, num_views, -1, -1).reshape(
-                    num_flat_views, sequence_length, spatial_dims)
-            target_ratios = target_ratio_base.unsqueeze(1).expand(
-                -1, num_views, -1, -1).reshape(
-                    num_flat_views, num_levels, 2)
-            target_mask = target_mask_base.unsqueeze(1).expand(
-                -1, num_views, -1).reshape(num_flat_views, sequence_length)
-            return self.cross_view_attention(
-                query_input, position_input, target_value,
+            return self.cross_view_attention.forward_with_shared_value(
+                projected_query_input, position_input, target_value_base,
                 spatial_shapes, spatial_level_start, target_references,
-                target_ratios, key_padding_mask=target_mask)
+                target_ratio_base, value_repeat=num_views,
+                key_padding_mask=target_mask_base,
+                output_dtype=normalized_query.dtype)
 
         for target_view in range(num_views):
             target_references = cross_reference_points[
@@ -276,7 +369,7 @@ class GroundingDINO3DDecoderLayer(nn.Module):
             target_positions = cross_query_positions[
                 ..., target_view, :].reshape_as(query_pos)
             attention_inputs = (
-                normalized_query, target_positions,
+                projected_query, target_positions,
                 values_by_view[:, target_view],
                 target_references, ratios_by_view[:, target_view],
                 masks_by_view[:, target_view])

@@ -157,15 +157,21 @@ class ReconDet(Base3DDetector):
             num_points=deformable_num_points,
             dropout=decoder_cfg['dec_dropout'])
 
-        self.feature_projector = VGGTFeatureProjector(
-            dense_head=dense_head,
-            dim_in=dense_head.norm.normalized_shape[0],
-            out_channels=[token_dim] * len(
-                dense_head.intermediate_layer_idx))
+        self.feature_projector = None
         self.detection_feature_projector = None
         if detection_pyramid_cfg is not None:
             self.detection_feature_projector = VGGTDetectionPyramid(
                 dense_head=dense_head, **dict(detection_pyramid_cfg))
+        if (self.detection_feature_projector is None
+                or self.detection_feature_projector.geometry_out_channels
+                is None):
+            self.feature_projector = VGGTFeatureProjector(
+                dense_head=dense_head,
+                dim_in=dense_head.norm.normalized_shape[0],
+                out_channels=[token_dim] * len(
+                    dense_head.intermediate_layer_idx))
+        if self.detection_feature_projector is not None:
+            self.detection_feature_projector.requires_grad_(True)
         if self.train_2d_only and self.detection_feature_projector is None:
             raise ValueError(
                 '2D VGGT pretraining requires detection_pyramid_cfg')
@@ -309,6 +315,22 @@ class ReconDet(Base3DDetector):
                     points_first)
             scales.append(self._vggt_gt_scale_cache[cache_key])
         return reference.new_tensor(scales, dtype=torch.float32)
+
+    def _project_feature_pyramids(self, vggt_token_list, images, ps_idx):
+        if (self.detection_feature_projector is not None
+                and self.detection_feature_projector.geometry_out_channels
+                is not None):
+            return self.detection_feature_projector(
+                vggt_token_list, images, ps_idx, return_geometry=True)
+        if self.feature_projector is None:
+            raise RuntimeError('No VGGT geometry feature projector configured')
+        geometry_features = self.feature_projector(
+            vggt_token_list, images, ps_idx)
+        detection_features = None
+        if self.detection_feature_projector is not None:
+            detection_features = self.detection_feature_projector(
+                vggt_token_list, images, ps_idx)
+        return detection_features, geometry_features
 
     def _build_projection_cameras(self, vggt_token_list, ps_idx, images,
                                   batch_inputs_dict, batch_data_samples,
@@ -476,8 +498,12 @@ class ReconDet(Base3DDetector):
 
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'train')
-        vggt_feature_maps = self.feature_projector(
-            vggt_token_list, img, ps_idx)
+        semantic_feature_maps, vggt_feature_maps = (
+            self._project_feature_pyramids(vggt_token_list, img, ps_idx))
+        if semantic_feature_maps is None:
+            raise RuntimeError(
+                'Full ReconDet requires detection_pyramid_cfg when using '
+                'the GroundingDINO external feature backbone')
         raw_extrinsics, intrinsics, pose_encoding = (
             self._build_projection_cameras(
                 vggt_token_list, ps_idx, img, batch_inputs_dict,
@@ -486,6 +512,7 @@ class ReconDet(Base3DDetector):
             self.semantic_encoder.loss(
                 batch_inputs_dict['imgs'],
                 batch_data_samples,
+                external_img_feats=semantic_feature_maps,
                 vggt_feature_maps=vggt_feature_maps,
                 vggt_extrinsics=raw_extrinsics,
                 vggt_intrinsics=intrinsics,
@@ -546,15 +573,20 @@ class ReconDet(Base3DDetector):
 
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'test')
-        vggt_feature_maps = self.feature_projector(
-            vggt_token_list, img, ps_idx)
+        semantic_feature_maps, vggt_feature_maps = (
+            self._project_feature_pyramids(vggt_token_list, img, ps_idx))
+        if semantic_feature_maps is None:
+            raise RuntimeError(
+                'Full ReconDet requires detection_pyramid_cfg when using '
+                'the GroundingDINO external feature backbone')
         raw_extrinsics, intrinsics = self._build_projection_cameras(
             vggt_token_list, ps_idx, img, batch_inputs_dict,
             batch_data_samples)
         reconstruction_outputs, _ = (
             self.semantic_encoder.predict_reconstruction(
                 batch_inputs_dict['imgs'], batch_data_samples,
-                vggt_feature_maps, raw_extrinsics, intrinsics))
+                vggt_feature_maps, raw_extrinsics, intrinsics,
+                external_img_feats=semantic_feature_maps))
         reconstruction_outputs = self._predict_reconstruction_objects(
             reconstruction_outputs)
         selected = self._select_reconstruction_boxes(
@@ -650,7 +682,7 @@ class ReconDet(Base3DDetector):
                 'Tensor mode is not supported during 2D pretraining')
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'train')
-        vggt_feature_maps = self.feature_projector(
+        _, vggt_feature_maps = self._project_feature_pyramids(
             vggt_token_list, img, ps_idx)
         raw_extrinsics, intrinsics = self._build_projection_cameras(
             vggt_token_list, ps_idx, img, batch_inputs_dict,

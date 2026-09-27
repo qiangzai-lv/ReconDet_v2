@@ -15,8 +15,9 @@ scannet_ann_root = '/root/shared-nvme/data/scannet_coco_v2/'
 gt_points_dir = f'{data_root}/points'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
 
-grounding_dino_config = 'configs/gdino/grounding_dino_swin-t_pretrain_obj365.py'
-grounding_dino_checkpoint = '/root/shared-nvme/code/Recondet_up/work_dirs/recondet_scannet/epoch_2.pth'
+grounding_dino_config = 'configs/gdino/grounding_dino_vggt_scannet.py'
+vggt_gdino_checkpoint = '/root/shared-nvme/code/Recondet_v6/work_dirs/recondet_scannet_2d/best_coco_bbox_mAP_epoch_16.pth'
+grounding_dino_checkpoint = vggt_gdino_checkpoint
 grounding_dino_classes = [
     'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
     'picture', 'counter', 'desk', 'curtain', 'refrigerator', 'shower curtain',
@@ -38,10 +39,15 @@ model = dict(
         dropout=0.0,
         gradient_checkpointing=True,
         checkpoint_start_block=3),
+    detection_pyramid_cfg=dict(
+        out_channels=256,
+        geometry_out_channels=512,
+        norm_groups=32),
     g_dino_cfg=dict(
         grounding_dino_config=grounding_dino_config,
         grounding_dino_checkpoint=grounding_dino_checkpoint,
-        semantic_classes=grounding_dino_classes),
+        semantic_classes=grounding_dino_classes,
+        train_visual_encoder=True),
     data_preprocessor=dict(
         type='ReconDetDataPreprocessor',
         bgr_to_rgb=True,
@@ -295,6 +301,17 @@ optim_wrapper = dict(
         lr=2.5e-4,
         weight_decay=1e-4
     ),
+    paramwise_cfg=dict(
+        custom_keys={
+            'vggt_encoder.aggregator': dict(lr_mult=0.1),
+            'detection_feature_projector': dict(lr_mult=0.1),
+            'detection_feature_projector.geometry_norms': dict(
+                lr_mult=1.0),
+            'semantic_encoder.model.encoder': dict(lr_mult=0.1),
+            'semantic_encoder.model.decoder': dict(lr_mult=0.1),
+            'semantic_encoder.model.bbox_head': dict(lr_mult=0.1),
+            'vggt_encoder.camera_head': dict(lr_mult=0.1),
+        }),
     clip_grad=dict(max_norm=35., norm_type=2)
 )
 
@@ -314,4 +331,12 @@ default_hooks = dict(
     logger=dict(type='LoggerHook', interval=10)
 )
 
+load_from = vggt_gdino_checkpoint
+resume = False
+
 find_unused_parameters = True
+
+model_wrapper_cfg = dict(
+    type='MMDistributedDataParallel',
+    find_unused_parameters=True,
+    static_graph=True)

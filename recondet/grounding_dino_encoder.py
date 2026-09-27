@@ -191,6 +191,8 @@ class GroundingDINOSemanticEncoder(nn.Module):
             # in eval mode.
             for module in self.model.children():
                 module.eval()
+            if self.train_visual_encoder:
+                self.model.encoder.train(mode)
             reconstruction_decoder = self.model.reconstruction_decoder
             if reconstruction_decoder is not None:
                 reconstruction_decoder.train(mode)
@@ -497,9 +499,16 @@ class GroundingDINOSemanticEncoder(nn.Module):
     @torch.no_grad()
     def predict_reconstruction(self, images, batch_data_samples,
                                vggt_feature_maps, vggt_extrinsics,
-                               vggt_intrinsics):
+                               vggt_intrinsics, external_img_feats=None):
         padded_shape = images.shape[-2:]
         batch_size, num_views = images.shape[:2]
+        flattened_external_features = None
+        if external_img_feats is not None:
+            flattened_external_features = tuple(
+                feature.reshape(
+                    batch_size * num_views,
+                    *feature.shape[2:]).contiguous()
+                for feature in external_img_feats)
         self._ensure_token_positive_map()
         flattened = self._normalize_images(images, batch_data_samples)
         samples = []
@@ -524,6 +533,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
         self.model.eval()
         view_predictions = self.model.predict(
             flattened, samples, rescale=False,
+            external_img_feats=flattened_external_features,
             vggt_feature_maps=flattened_vggt_features,
             vggt_extrinsics=flattened_extrinsics,
             vggt_intrinsics=flattened_intrinsics,

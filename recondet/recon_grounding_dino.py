@@ -17,6 +17,17 @@ from recondet.scene_query_exchange import SceneQueryExchange
 
 
 @MODELS.register_module()
+class ExternalFeatureBackbone(nn.Module):
+    """Placeholder backbone for detectors driven by injected features."""
+
+    requires_external_features = True
+
+    def forward(self, inputs):
+        raise RuntimeError(
+            'ExternalFeatureBackbone requires injected image features')
+
+
+@MODELS.register_module()
 class ReconGroundingDINO(GroundingDINO):
 
     def __init__(self, *args, reconstruction_decoder=None,
@@ -26,6 +37,7 @@ class ReconGroundingDINO(GroundingDINO):
         if reconstruction_decoder is not None:
             self.reconstruction_decoder = GroundingDINO3DDecoder(
                 num_queries=self.num_queries, **reconstruction_decoder)
+        self._active_external_img_feats = None
         self._active_vggt_feature_maps = None
         self._active_vggt_extrinsics = None
         self._active_vggt_intrinsics = None
@@ -43,6 +55,20 @@ class ReconGroundingDINO(GroundingDINO):
                     SceneQueryExchange(embed_dims=self.embed_dims, **cfg)
                     for _ in range(self.decoder.num_layers)
                 ])
+
+    @contextmanager
+    def _using_external_img_feats(self, feature_maps):
+        previous = self._active_external_img_feats
+        self._active_external_img_feats = feature_maps
+        try:
+            yield
+        finally:
+            self._active_external_img_feats = previous
+
+    def extract_feat(self, batch_inputs: Tensor) -> Tuple[Tensor]:
+        if self._active_external_img_feats is not None:
+            return self._active_external_img_feats
+        return super().extract_feat(batch_inputs)
 
     def _exchange_detection_queries(self, query: Tensor, layer_id: int,
                                     num_views: int = None) -> Tensor:
@@ -285,17 +311,19 @@ class ReconGroundingDINO(GroundingDINO):
         }
 
     def loss(self, batch_inputs: Tensor,
-             batch_data_samples: SampleList, vggt_feature_maps=None,
+             batch_data_samples: SampleList, external_img_feats=None,
+             vggt_feature_maps=None,
              vggt_extrinsics=None, vggt_intrinsics=None,
              image_shapes=None,
              vggt_valid_ratios=None,
              num_views=1,
              return_reconstruction=False) -> Union[dict, list]:
-        with self._using_vggt_features(
-                vggt_feature_maps, vggt_extrinsics, vggt_intrinsics,
-                image_shapes, vggt_valid_ratios=vggt_valid_ratios,
-                num_views=num_views):
-            losses = super().loss(batch_inputs, batch_data_samples)
+        with self._using_external_img_feats(external_img_feats):
+            with self._using_vggt_features(
+                    vggt_feature_maps, vggt_extrinsics, vggt_intrinsics,
+                    image_shapes, vggt_valid_ratios=vggt_valid_ratios,
+                    num_views=num_views):
+                losses = super().loss(batch_inputs, batch_data_samples)
         if not return_reconstruction:
             return losses
         if self._last_reconstruction_hidden_states is None:
@@ -308,12 +336,14 @@ class ReconGroundingDINO(GroundingDINO):
         )
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True,
-                vggt_feature_maps=None, vggt_extrinsics=None,
+                external_img_feats=None, vggt_feature_maps=None,
+                vggt_extrinsics=None,
                 vggt_intrinsics=None, image_shapes=None,
                 vggt_valid_ratios=None, num_views=1):
-        with self._using_vggt_features(
-                vggt_feature_maps, vggt_extrinsics, vggt_intrinsics,
-                image_shapes, vggt_valid_ratios=vggt_valid_ratios,
-                num_views=num_views):
-            return super().predict(
-                batch_inputs, batch_data_samples, rescale=rescale)
+        with self._using_external_img_feats(external_img_feats):
+            with self._using_vggt_features(
+                    vggt_feature_maps, vggt_extrinsics, vggt_intrinsics,
+                    image_shapes, vggt_valid_ratios=vggt_valid_ratios,
+                    num_views=num_views):
+                return super().predict(
+                    batch_inputs, batch_data_samples, rescale=rescale)

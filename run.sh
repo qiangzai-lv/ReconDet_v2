@@ -1,4 +1,4 @@
-bash tools/dist_train.sh configs/recondet/recondet_scannet.py 1
+bash tools/dist_train.sh configs/recondet/recondet_scannet_2d.py 1
 
 
 bash tools_mmdet/dist_train.sh configs/gdino/grounding_dino_swin-t_pretrain_obj365_ori.py 1

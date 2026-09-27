@@ -78,6 +78,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
                  supervise_instance_consistency: bool = False,
                  instance_consistency_cfg=None,
                  scene_query_exchange_cfg=None,
+                 train_visual_encoder: bool = False,
                  supervise_confident_query_depth: bool = False,
                  confident_query_depth_cfg=None) -> None:
         super().__init__()
@@ -91,6 +92,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
         self.use_scene_query_exchange = bool(
             scene_query_exchange_cfg
             and scene_query_exchange_cfg.get('enabled', True))
+        self.train_visual_encoder = bool(train_visual_encoder)
         self.supervise_confident_query_depth = bool(
             supervise_confident_query_depth)
         config_path = Path(config).expanduser()
@@ -126,6 +128,11 @@ class GroundingDINOSemanticEncoder(nn.Module):
             checkpoint, map_location='cpu')
         state_dict = checkpoint_data.get('state_dict', checkpoint_data)
         state_dict = extract_grounding_dino_state_dict(state_dict)
+        if getattr(self.model.backbone, 'requires_external_features', False):
+            state_dict = {
+                name: value for name, value in state_dict.items()
+                if not name.startswith(('backbone.', 'neck.'))
+            }
         if not self.pretrain_2d_only:
             require_pretrained_instance_projection(
                 state_dict, self.model.bbox_head.instance_projection)
@@ -160,6 +167,8 @@ class GroundingDINOSemanticEncoder(nn.Module):
             for module in (self.model.query_embedding, self.model.decoder,
                            self.model.bbox_head):
                 module.requires_grad_(True)
+        if self.train_visual_encoder:
+            self.model.encoder.requires_grad_(True)
         scene_query_exchange = getattr(
             self.model, 'scene_query_exchange', None)
         if (scene_query_exchange is not None
@@ -187,7 +196,10 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 reconstruction_decoder.train(mode)
             self.model.bbox_head.reconstruction_head.train(mode)
             return self
-        for module_name in ('backbone', 'neck', 'encoder', 'language_model'):
+        frozen_module_names = ['backbone', 'neck', 'language_model']
+        if not self.train_visual_encoder:
+            frozen_module_names.append('encoder')
+        for module_name in frozen_module_names:
             module = getattr(self.model, module_name, None)
             if module is not None:
                 module.eval()
@@ -361,7 +373,8 @@ class GroundingDINOSemanticEncoder(nn.Module):
             return scene_samples
         return [sample for samples in scene_samples for sample in samples]
 
-    def loss(self, images, batch_data_samples, vggt_feature_maps=None,
+    def loss(self, images, batch_data_samples, external_img_feats=None,
+             vggt_feature_maps=None,
              vggt_extrinsics=None, vggt_intrinsics=None,
              return_reconstruction=False, gt_depths_vggt=None,
              gt_depth_valid_masks=None, vggt_gt_scale=None):
@@ -386,6 +399,12 @@ class GroundingDINOSemanticEncoder(nn.Module):
                     batch_size * num_views, *feature.shape[2:]).contiguous()
                 for feature in vggt_feature_maps
             ]
+        flattened_external_features = None
+        if external_img_feats is not None:
+            flattened_external_features = tuple(
+                feature.reshape(
+                    batch_size * num_views, *feature.shape[2:]).contiguous()
+                for feature in external_img_feats)
         flattened_extrinsics = None
         flattened_intrinsics = None
         if vggt_extrinsics is not None and vggt_intrinsics is not None:
@@ -402,6 +421,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
         result = self.model.loss(
             normalized,
             samples,
+            external_img_feats=flattened_external_features,
             vggt_feature_maps=flattened_vggt_features,
             vggt_extrinsics=flattened_extrinsics,
             vggt_intrinsics=flattened_intrinsics,
@@ -415,7 +435,8 @@ class GroundingDINOSemanticEncoder(nn.Module):
         return result
 
     @torch.no_grad()
-    def predict_scene_2d(self, images, batch_data_samples):
+    def predict_scene_2d(self, images, batch_data_samples,
+                         external_img_feats=None):
         batch_size, num_views = images.shape[:2]
         padded_shape = images.shape[-2:]
         normalized = self._normalize_images(images, batch_data_samples)
@@ -436,8 +457,16 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 for source_sample in batch_data_samples
                 for view_index in range(num_views)
             ]
+        flattened_external_features = None
+        if external_img_feats is not None:
+            flattened_external_features = tuple(
+                feature.reshape(
+                    batch_size * num_views, *feature.shape[2:]).contiguous()
+                for feature in external_img_feats)
         predictions = self.model.predict(
-            normalized, view_samples, rescale=True, num_views=num_views)
+            normalized, view_samples, rescale=True,
+            external_img_feats=flattened_external_features,
+            num_views=num_views)
         if len(predictions) != batch_size * num_views:
             raise RuntimeError('2D predictions do not match the scene views')
         similarity_stats = None

@@ -14,7 +14,8 @@ from recondet.camera_alignment import (
 from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.device import autocast, get_device
-from recondet.feature_projection import VGGTFeatureProjector
+from recondet.feature_projection import (
+    VGGTDetectionPyramid, VGGTFeatureProjector)
 from recondet.geometry_attention import GeometryAwareDeformableDecoder
 from recondet.grounding_dino_encoder import GroundingDINOSemanticEncoder
 from recondet.query_correspondence import select_reconstruction_boxes
@@ -60,6 +61,7 @@ class ReconDet(Base3DDetector):
             if_mix_precision=False,
             vggt_omega_checkpoint=None,
             vggt_lora_cfg=None,
+            detection_pyramid_cfg=None,
             deformable_num_points=4,
             reconstruction_nms_cfg=None,
             gt_points_dir=None,
@@ -127,6 +129,8 @@ class ReconDet(Base3DDetector):
                 supervise_instance_consistency),
             instance_consistency_cfg=instance_consistency_cfg,
             scene_query_exchange_cfg=scene_query_exchange_cfg,
+            train_visual_encoder=bool(
+                g_dino_cfg.get('train_visual_encoder', False)),
             supervise_confident_query_depth=(
                 supervise_confident_query_depth),
             confident_query_depth_cfg=confident_query_depth_cfg)
@@ -158,6 +162,13 @@ class ReconDet(Base3DDetector):
             dim_in=dense_head.norm.normalized_shape[0],
             out_channels=[token_dim] * len(
                 dense_head.intermediate_layer_idx))
+        self.detection_feature_projector = None
+        if detection_pyramid_cfg is not None:
+            self.detection_feature_projector = VGGTDetectionPyramid(
+                dense_head=dense_head, **dict(detection_pyramid_cfg))
+        if self.train_2d_only and self.detection_feature_projector is None:
+            raise ValueError(
+                '2D VGGT pretraining requires detection_pyramid_cfg')
 
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
@@ -200,22 +211,23 @@ class ReconDet(Base3DDetector):
 
     def _configure_2d_pretrain_trainability(self):
         frozen_modules = (
-            self.vggt_encoder, self.feature_projector,
-            self.reconstruction_object_head,
+            self.feature_projector, self.reconstruction_object_head,
             self.decoder, self.bbox_head,
             self.pos_embedding, self.query_projection)
         for module in frozen_modules:
             module.requires_grad_(False)
             module.eval()
+        self.detection_feature_projector.requires_grad_(True)
+        self.detection_feature_projector.train(self.training)
 
     def _configure_vggt_trainability(self, training):
         self.vggt_encoder.requires_grad_(False)
         self.vggt_encoder.eval()
-        if self.train_2d_only:
-            return
         if self.vggt_lora_enabled:
             enable_lora_parameters(self.vggt_encoder.aggregator)
             self.vggt_encoder.aggregator.train(bool(training))
+        if self.train_2d_only:
+            return
         camera_head = self.vggt_encoder.camera_head
         camera_head.requires_grad_(self.supervise_camera_head)
         camera_head.train(bool(training and self.supervise_camera_head))
@@ -450,9 +462,14 @@ class ReconDet(Base3DDetector):
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
         if self.train_2d_only:
+            vggt_token_list, ps_idx, img = self.extract_feat(
+                batch_inputs_dict, batch_data_samples, 'train')
+            semantic_feature_maps = self.detection_feature_projector(
+                vggt_token_list, img, ps_idx)
             semantic_losses = self.semantic_encoder.loss(
                 batch_inputs_dict['imgs'],
                 batch_data_samples,
+                external_img_feats=semantic_feature_maps,
                 return_reconstruction=False)
             return {f'gdino_{name}': value
                     for name, value in semantic_losses.items()}
@@ -519,8 +536,13 @@ class ReconDet(Base3DDetector):
                 **kwargs) -> SampleList:
 
         if self.train_2d_only:
+            vggt_token_list, ps_idx, img = self.extract_feat(
+                batch_inputs_dict, batch_data_samples, 'test')
+            semantic_feature_maps = self.detection_feature_projector(
+                vggt_token_list, img, ps_idx)
             return self.semantic_encoder.predict_scene_2d(
-                batch_inputs_dict['imgs'], batch_data_samples)
+                batch_inputs_dict['imgs'], batch_data_samples,
+                external_img_feats=semantic_feature_maps)
 
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'test')
